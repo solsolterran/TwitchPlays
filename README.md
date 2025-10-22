@@ -10,13 +10,13 @@ Quick Start
   - YOUTUBE_STREAM_URL
   - YOUTUBE_API_KEY
 - Launch:
-  - `python -m stream_handler.TwitchPlays --game gta5`
-- Enable/disable injection: press `Alt+Shift+P` (default).
-- Kills program immediately: `Ctrl+Shift+Backspace` (default).
+  - `sudo python -m stream_handler.TwitchPlays --game gta5`
+- Enable/disable injection: press `Alt+Shift+P`.
+- Kills program immediately: `Ctrl+Shift+Backspace`.
 
 Environment (common)
 - `TWITCH_CHANNEL`: lowercase channel (e.g., `yourchannel`).
-- YouTube (optional): `YOUTUBE_CHANNEL_ID`, `YOUTUBE_STREAM_URL` (for unlisted tests), `YOUTUBE_API_KEY`.
+- YouTube (optional): `YOUTUBE_CHANNEL_ID`, `YOUTUBE_STREAM_URL`, `YOUTUBE_API_KEY`.
 - Voting: fixed window `3s`, cap `200` messages per window, max message length `64`.
 - Focus gate: configured via `profiles/<game>.json` (`target_process`, `window_title_contains`).
 - Hotkeys: fixed — toggle `Alt+Shift+P`, hard kill `Ctrl+Shift+Backspace`.
@@ -30,18 +30,22 @@ Profiles
   - If a profile exists for `--game <key>`, it is used.
   - If no profile exists, the runner attempts to load a plugin module named like `games.<key>:<Class>`.
 - Supported macro steps:
+  - `{"type":"key_tap","key":"E"}`
   - `{"type":"key_pulse","key":"W","duration_ms":1000}`
   - `{"type":"key_release","key":"W"}` or `{"type":"key_release","keys":["W","S"]}`
   - `{"type":"key_combo","keys":["W","D"],"duration_ms":2000}`
+  - `{"type":"mouse_down","button":"left"}` / `{"type":"mouse_up","button":"left"}`
   - `{"type":"mouse_click","button":"left"}`
   - `{"type":"mouse_move","dx":200,"dy":0}`
 
-Behavior & Safety
-- Voting window: 3s by default; per-user dedupe; tie → last-of-top wins.
-- Safety: executes only when focused; immediate reset via `release_all()` after each window.
-- Exclusive source: `input_mode` is `chat` or `external`; the inactive source is ignored/blocked.
-- Global min gap between executions (300 ms) and a circuit breaker disable injection after repeated errors.
-- Sources: defaults to reading Twitch and YouTube; YouTube connection is skipped unless configured.
+Macro types
+- `key_tap`: quick press-and-release of a key (default ~60 ms unless you set `duration_ms`).
+- `key_pulse`: like a tap, but held for the specified `duration_ms` before release.
+- `key_release`: releases one or more keys if they’re currently held.
+- `key_combo`: holds multiple keys together for `duration_ms`, then releases them.
+- `mouse_down` / `mouse_up`: press or release a mouse button (`left`/`right`/`middle`).
+- `mouse_click`: a single mouse click of the given button.
+- `mouse_move`: move the mouse by `dx`,`dy` relative to its current position.
 
 Profile JSON example
 ```
@@ -64,5 +68,5 @@ Profile JSON example
 ```
 
 Notes
-- Run as Administrator for reliable keyboard/mouse injection.
+- Run as Administrator.
 
