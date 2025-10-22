@@ -1,10 +1,10 @@
-# DougDoug Note: 
+# DougDoug Note:
 # This code contains key codes plus functions to press keys on Windows
 # You should not need to modify anything in this file, just use as is.
 
 import time
 import ctypes
-import pynput
+from ctypes import wintypes
 
 #############################################################
 #################### DIRECT X KEY CODES #####################
@@ -122,26 +122,99 @@ MOUSE_WHEEL_DOWN = 0x109
 ################## DIRECT INPUT FUNCTIONS ###################
 #############################################################
 
-# Direct Input functions found at: https://stackoverflow.com/questions/53643273/how-to-keep-pynput-and-ctypes-from-clashing
-# Use these to prevent conflict errors with pynput.
-SendInput = ctypes.windll.user32.SendInput
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
 
-def HoldKey(hexKeyCode):
-    extra = ctypes.c_ulong(0)
-    ii_ = pynput._util.win32.INPUT_union()
-    ii_.ki = pynput._util.win32.KEYBDINPUT(0, hexKeyCode, 0x0008, 0, ctypes.cast(ctypes.pointer(extra), ctypes.c_void_p))
-    x = pynput._util.win32.INPUT(ctypes.c_ulong(1), ii_)
-    SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+# Structures for SendInput
+# Correct ULONG_PTR as an integer-sized pointer, not a pointer type
+if ctypes.sizeof(ctypes.c_void_p) == 8:
+    ULONG_PTR = ctypes.c_ulonglong
+else:
+    ULONG_PTR = ctypes.c_ulong
 
-def ReleaseKey(hexKeyCode):
-    extra = ctypes.c_ulong(0)
-    ii_ = pynput._util.win32.INPUT_union()
-    ii_.ki = pynput._util.win32.KEYBDINPUT(0, hexKeyCode, 0x0008 | 0x0002, 0, ctypes.cast(ctypes.pointer(extra), ctypes.c_void_p))
-    x = pynput._util.win32.INPUT(ctypes.c_ulong(1), ii_)
-    SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [
+        ("ki", KEYBDINPUT),
+        ("mi", MOUSEINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("u", _INPUTUNION),
+    ]
+
+
+# Bind SendInput with last-error tracking so we can debug failures
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+SendInput = _user32.SendInput
+SendInput.restype = wintypes.UINT
+SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+
+
+def send_key(scan_code: int, flags: int) -> None:
+    ki = KEYBDINPUT(
+        wVk=0,
+        wScan=scan_code & 0xFFFF,
+        dwFlags=flags,
+        time=0,
+        dwExtraInfo=ULONG_PTR(0),
+    )
+    inp = INPUT(type=1, u=_INPUTUNION(ki=ki))
+    n = SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    if n != 1:
+        try:
+            err = ctypes.get_last_error()
+        except Exception:
+            err = None
+        # Print only on failure to avoid noisy logs
+        print(f"SendInput failed (scan=0x{scan_code:X} flags=0x{flags:X}) err={err}")
+
+
+def HoldKey(hexKeyCode: int) -> None:
+    send_key(hexKeyCode, KEYEVENTF_SCANCODE)
+
+
+def ReleaseKey(hexKeyCode: int) -> None:
+    send_key(hexKeyCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP)
+
 
 # Holds down a key for the specified number of seconds
-def HoldAndReleaseKey(hexKeyCode, seconds):
+def HoldAndReleaseKey(hexKeyCode: int, seconds: float) -> None:
     HoldKey(hexKeyCode)
     time.sleep(seconds)
     ReleaseKey(hexKeyCode)

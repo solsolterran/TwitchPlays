@@ -1,0 +1,64 @@
+{
+        "name": "gta5_flying",
+        "target_process": "gta5.exe",
+        "window_title_contains": "Grand Theft Auto V",
+
+        "aliases": {
+                "fly": "throttle_up",
+                "slow": "throttle_down",
+
+                "yaw left": "yaw_left",
+                "yaw right": "yaw_right",
+                "roll left": "roll_left",
+                "roll right": "roll_right",
+                "pitch up": "pitch_up",
+                "pitch down": "pitch_down",
+
+                "gear": "gear",
+                "fire": "fire",
+                "vtol": "vtol",
+                "cam": "cam",
+                "takeoff": "plane_takeoff",
+
+                "heli up": "heli_up",
+                "heli down": "heli_down",
+                "heli yaw left": "heli_yaw_left",
+                "heli yaw right": "heli_yaw_right",
+                "heli fwd": "heli_forward",
+                "heli back": "heli_back"
+        },
+
+        "macros": {
+                "===== Plane =====": [],
+
+                "throttle_up":   [{ "type": "key_pulse", "key": "W",     "duration_ms": 600 }],
+                "throttle_down": [{ "type": "key_pulse", "key": "S",     "duration_ms": 600 }],
+
+                "yaw_left":  [{ "type": "key_pulse", "key": "A",     "duration_ms": 250 }],
+                "yaw_right": [{ "type": "key_pulse", "key": "D",     "duration_ms": 250 }],
+
+                "roll_left":  [{ "type": "key_pulse", "key": "NUM4", "duration_ms": 250 }],
+                "roll_right": [{ "type": "key_pulse", "key": "NUM6", "duration_ms": 250 }],
+
+                "pitch_up":   [{ "type": "key_pulse", "key": "NUM5", "duration_ms": 250 }],
+                "pitch_down": [{ "type": "key_pulse", "key": "NUM8", "duration_ms": 250 }],
+
+                "gear": [{ "type": "key_tap", "key": "G" }],
+                "fire": [{ "type": "key_pulse", "key": "SPACE", "duration_ms": 120 }],
+                "vtol": [{ "type": "key_tap", "key": "E" }],
+                "cam":  [{ "type": "key_tap", "key": "V" }],
+                "plane_takeoff": [
+                        { "type": "key_pulse", "key": "W",     "duration_ms": 1000 },
+                        { "type": "key_pulse", "key": "NUM5",  "duration_ms": 300 },
+                        { "type": "key_tap",   "key": "G" }
+                ],
+
+                "===== Helicopter =====": [],
+                "heli_up":        [{ "type": "key_pulse", "key": "W",     "duration_ms": 400 }],
+                "heli_down":      [{ "type": "key_pulse", "key": "S",     "duration_ms": 400 }],
+                "heli_yaw_left":  [{ "type": "key_pulse", "key": "A",     "duration_ms": 250 }],
+                "heli_yaw_right": [{ "type": "key_pulse", "key": "D",     "duration_ms": 250 }],
+                "heli_forward":   [{ "type": "key_pulse", "key": "NUM8",  "duration_ms": 200 }],
+                "heli_back":      [{ "type": "key_pulse", "key": "NUM5",  "duration_ms": 200 }]
+        }
+}
