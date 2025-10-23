@@ -44,13 +44,13 @@
   },
 
   "macros": {
-    "walk":   [{ "type": "key_pulse", "key": "W", "duration_ms": 2000 }],
-    "drive":   [{ "type": "key_pulse", "key": "W", "duration_ms": 1000 }],
-    "left":   [{ "type": "key_pulse", "key": "A", "duration_ms": 2000 }],
-    "right":  [{ "type": "key_pulse", "key": "D", "duration_ms": 2000 }],
-    "reverse":[{ "type": "key_pulse", "key": "S", "duration_ms": 1000 }],
+    "walk":   [{ "type": "key_press", "key": "W", "duration_ms": 2000 }],
+    "drive":   [{ "type": "key_press", "key": "W", "duration_ms": 1000 }],
+    "left":   [{ "type": "key_press", "key": "A", "duration_ms": 2000 }],
+    "right":  [{ "type": "key_press", "key": "D", "duration_ms": 2000 }],
+    "reverse":[{ "type": "key_press", "key": "S", "duration_ms": 1000 }],
     "stop":   [{ "type": "key_release", "keys": ["W","S"] }],
-    "brake":  [{ "type": "key_pulse", "key": "SPACE", "duration_ms": 700 }],
+    "brake":  [{ "type": "key_press", "key": "SPACE", "duration_ms": 700 }],
 
     "shoot":  [{ "type": "mouse_click", "button": "left" }],
     "cover":  [{ "type": "key_tap", "key": "Q" }],
@@ -73,14 +73,14 @@
 
     "open_weapon_wheel": [{ "type": "key_combo", "keys": ["TAB"], "duration_ms": 800 }],
 
-    "weap_unarmed":   [{ "type": "key_pulse", "key": "1", "duration_ms": 60 }],
-    "weap_melee":     [{ "type": "key_pulse", "key": "2", "duration_ms": 60 }],
-    "weap_shotgun":   [{ "type": "key_pulse", "key": "3", "duration_ms": 60 }],
-    "weap_heavy":     [{ "type": "key_pulse", "key": "4", "duration_ms": 60 }],
-    "weap_throwable": [{ "type": "key_pulse", "key": "5", "duration_ms": 60 }],
-    "weap_pistol":    [{ "type": "key_pulse", "key": "6", "duration_ms": 60 }],
-    "weap_smg":       [{ "type": "key_pulse", "key": "7", "duration_ms": 60 }],
-    "weap_rifle":     [{ "type": "key_pulse", "key": "8", "duration_ms": 60 }],
-    "weap_sniper":    [{ "type": "key_pulse", "key": "9", "duration_ms": 60 }]
+    "weap_unarmed":   [{ "type": "key_press", "key": "1", "duration_ms": 60 }],
+    "weap_melee":     [{ "type": "key_press", "key": "2", "duration_ms": 60 }],
+    "weap_shotgun":   [{ "type": "key_press", "key": "3", "duration_ms": 60 }],
+    "weap_heavy":     [{ "type": "key_press", "key": "4", "duration_ms": 60 }],
+    "weap_throwable": [{ "type": "key_press", "key": "5", "duration_ms": 60 }],
+    "weap_pistol":    [{ "type": "key_press", "key": "6", "duration_ms": 60 }],
+    "weap_smg":       [{ "type": "key_press", "key": "7", "duration_ms": 60 }],
+    "weap_rifle":     [{ "type": "key_press", "key": "8", "duration_ms": 60 }],
+    "weap_sniper":    [{ "type": "key_press", "key": "9", "duration_ms": 60 }]
   }
 }

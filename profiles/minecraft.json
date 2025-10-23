@@ -1,0 +1,75 @@
+{
+  "name": "minecraft",
+  "target_process": "javaw.exe",
+  "window_title_contains": "Minecraft 1.21.10",
+  "aliases": {
+    "walk": "walk",
+    "sneak walk": "sneak_walk",
+    "run": "run",
+    "run jump": "run_jump",
+    "back": "back",
+    "left": "left",
+    "right": "right",
+    "jump": "jump",
+    
+    "look up": "look_up",
+    "look down": "look_down",
+    "turn left": "turn_left",
+    "turn right": "turn_right",
+    "mine light": "mine_light",
+    "mine mid": "mine_mid",
+    "mine heavy": "mine_heavy",
+    "hit": "hit",
+    "place": "place",
+    "slot 1": "slot1",
+    "slot 2": "slot2",
+    "slot 3": "slot3",
+    "slot 4": "slot4",
+    "slot 5": "slot5",
+    "slot 6": "slot6",
+    "slot 7": "slot7",
+    "slot 8": "slot8",
+    "slot 9": "slot9"
+  },
+  "macros": {
+    "walk": [{ "type": "key_press", "key": "W", "duration_ms": 1000 }],
+    "sneak_walk": [{ "type": "key_combo", "keys": ["W","LEFT_SHIFT"], "duration_ms": 1000 }],
+    "run": [{ "type": "key_combo", "keys": ["W","LEFT_CTRL"], "duration_ms": 1000 }],
+    "run_jump": [
+      { "type": "key_hold",  "key": "LEFT_CTRL" },
+      { "type": "key_hold",  "key": "W" },
+      { "type": "key_combo", "keys": [], "duration_ms": 150 },
+      { "type": "key_tap",   "key": "SPACE", "duration_ms": 60 },
+      { "type": "key_combo", "keys": [], "duration_ms": 150 }
+    ],
+    "back":    [{ "type": "key_press", "key": "S", "duration_ms": 500 }],
+    "left":    [{ "type": "key_press", "key": "A", "duration_ms": 500 }],
+    "right":   [{ "type": "key_press", "key": "D", "duration_ms": 500 }],
+    "jump":    [{ "type": "key_tap",   "key": "SPACE"}],
+    
+    "look_up":    [{ "type": "mouse_move", "dx": 0,   "dy": -30 }],
+    "look_down":  [{ "type": "mouse_move", "dx": 0,   "dy": 30 }],
+    "turn_left":  [{ "type": "mouse_move", "dx": -400, "dy": 0 }],
+    "turn_right": [{ "type": "mouse_move", "dx": 400,  "dy": 0 }],
+    "hit":   [{ "type": "mouse_click", "button": "left" }],
+    "place": [{ "type": "mouse_click", "button": "right" }],
+    "mine_light":   [
+      { "type": "mouse_hold", "button": "left", "duration_ms": 500 }
+    ],
+    "mine_mid":   [
+      { "type": "mouse_hold", "button": "left", "duration_ms": 1500 }
+    ],
+    "mine_heavy":  [
+      { "type": "mouse_hold", "button": "left", "duration_ms": 3000 }
+    ],
+    "slot1": [{ "type": "key_tap", "key": "1"}],
+    "slot2": [{ "type": "key_tap", "key": "2"}],
+    "slot3": [{ "type": "key_tap", "key": "3"}],
+    "slot4": [{ "type": "key_tap", "key": "4"}],
+    "slot5": [{ "type": "key_tap", "key": "5"}],
+    "slot6": [{ "type": "key_tap", "key": "6"}],
+    "slot7": [{ "type": "key_tap", "key": "7"}],
+    "slot8": [{ "type": "key_tap", "key": "8"}],
+    "slot9": [{ "type": "key_tap", "key": "9"}]
+  }
+}

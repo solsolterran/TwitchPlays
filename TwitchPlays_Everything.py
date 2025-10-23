@@ -305,7 +305,7 @@ def toggle_injection():
     last_toggle_ts = now
     injection_enabled = not injection_enabled
     state = "ENABLED" if injection_enabled else "DISABLED"
-    print(f"[TP] Injection {state}.")
+    print(f"Injection {state}.")
     if not injection_enabled:
         release_all()
 
@@ -376,17 +376,9 @@ def main():
     try:
         keyboard.add_hotkey(TOGGLE_HOTKEY, toggle_injection, suppress=False)
         keyboard.add_hotkey(KILL_HOTKEY, lambda: os._exit(0), suppress=False)
-        print(f"[TP] Soft toggle: {TOGGLE_HOTKEY} | Hard kill: {KILL_HOTKEY}")
+        print(f"Soft toggle: {TOGGLE_HOTKEY} | Hard kill: {KILL_HOTKEY}")
     except Exception as e:
-        print(f"[TP] Hotkeys unavailable: {e}")
-
-    # Logging setup
-    log_dir = Path("logs") / "twitchplays"
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    log_path = log_dir / "runner.jsonl"
+        print(f"Hotkeys unavailable: {e}")
 
     # Voting window state
     window_end = time.time() + VOTE_WINDOW_SEC
@@ -519,11 +511,6 @@ def main():
                 "unknown": unknown,
                 "reason": reason,
             }
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(payload) + "\n")
-            except Exception:
-                pass
 
             # Reset window
             window_end = now + VOTE_WINDOW_SEC
@@ -570,6 +557,12 @@ def keycode_from_name(name: str) -> Optional[int]:
         "ENTER": ENTER,
         "ESC": ESC,
         "TAB": TAB,
+        "LEFT_SHIFT": LEFT_SHIFT,
+        "LEFT_CTRL": LEFT_CONTROL,
+        "LEFT_ALT": LEFT_ALT,
+        "RIGHT_SHIFT": RIGHT_SHIFT,
+        "RIGHT_CTRL": RIGHT_CONTROL,
+        "RIGHT_ALT": RIGHT_ALT,
         "LEFT": LEFT_ARROW,
         "RIGHT": RIGHT_ARROW,
         "UP": UP_ARROW,
@@ -628,7 +621,7 @@ def execute_macro(steps: list) -> None:
         if not isinstance(step, dict):
             continue
         t = str(step.get("type") or "").lower()
-        if t == "key_pulse":
+        if t == "key_press":
             kc = keycode_from_name(str(step.get("key") or ""))
             ms = min(MAX_MS, max(0, int(step.get("duration_ms") or 0)))
             if kc and ms:
@@ -638,6 +631,10 @@ def execute_macro(steps: list) -> None:
             ms = min(MAX_MS, max(0, int(step.get("duration_ms") or 60)))
             if kc:
                 press_and_release(kc, ms / 1000.0)
+        elif t == "key_hold":
+            kc = keycode_from_name(str(step.get("key") or ""))
+            if kc:
+                press_hold(kc)
         elif t == "key_release":
             key = step.get("key")
             keys = step.get("keys")
@@ -665,6 +662,13 @@ def execute_macro(steps: list) -> None:
         elif t == "mouse_click":
             b = str(step.get("button") or "left").lower()
             mouse_click(b)
+        elif t == "mouse_pulse":
+            b = str(step.get("button") or "left").lower()
+            ms = min(MAX_MS, max(0, int(step.get("duration_ms") or 0)))
+            mouse_down(b)
+            if ms:
+                time.sleep(ms / 1000.0)
+            mouse_up(b)
         elif t == "mouse_move":
             dx = int(step.get("dx") or 0)
             dy = int(step.get("dy") or 0)
