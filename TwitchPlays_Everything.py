@@ -36,7 +36,7 @@ from focus_gate import set_focus_target, is_target_focused
 ##################### STREAM / PLATFORM CONFIG #####################
 
 # Replace this with your Twitch username. Must be all lowercase.
-TWITCH_CHANNEL = os.environ.get("TWITCH_CHANNEL", "solarterran").lower()
+TWITCH_CHANNEL = os.environ.get("TWITCH_CHANNEL").lower()
 
 # Sources: default to both Twitch and YouTube; YouTube is skipped gracefully
 # at runtime when not configured.

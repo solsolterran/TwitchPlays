@@ -11,11 +11,11 @@ Quick Start
 - Install deps (Run terminal as Administrator):
   - `pip install -r requirements.txt`
 - Sets `.env` and set values you care about.
-  - TWITCH_CHANNEL
-  - STREAM_SOURCES
-  - YOUTUBE_CHANNEL_ID
-  - YOUTUBE_STREAM_URL
-  - YOUTUBE_API_KEY
+  - TWITCH_CHANNEL - Your Twitch username (lowercase).
+  - STREAM_SOURCES - Chat sources to read, comma-separated (e.g., twitch,youtube).
+  - YOUTUBE_CHANNEL_ID - Your YouTube Channel ID (not your handle).
+  - YOUTUBE_STREAM_URL - Optional: direct URL of the live video (e.g., https://youtu.be/VIDEO_ID), useful for unlisted/specific streams.
+  - YOUTUBE_API_KEY - Optional: YouTube Data API v3 key; falls back to scraping if absent or over quota.
  - Launch (Windows PowerShell, run as Administrator):
    - `sudo python -m TwitchPlays_Everything --game minecraft`
 - Enable/disable injection: press `Alt+Shift+P`.
