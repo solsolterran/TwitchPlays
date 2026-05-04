@@ -1,5 +1,4 @@
 {
-  "name": "minecraft",
   "target_process": "javaw.exe",
   "window_title_contains": "Minecraft 1.21.10",
   "aliases": {

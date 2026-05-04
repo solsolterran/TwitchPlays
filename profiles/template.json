@@ -1,0 +1,28 @@
+{
+  "target_process": "",
+  "window_title_contains": "",
+  "aliases": {
+    "walk": "walk",
+    "back": "back",
+    "left": "left",
+    "right": "right",
+    "jump": "jump",
+    "center click": "center_click",
+    "look up": "look_up",
+    "look down": "look_down",
+    "look left": "look_left",
+    "look right": "look_right"
+  },
+  "macros": {
+    "walk": [{ "type": "key_press", "key": "W", "duration_ms": 1000 }],
+    "back": [{ "type": "key_press", "key": "S", "duration_ms": 500 }],
+    "left": [{ "type": "key_press", "key": "A", "duration_ms": 500 }],
+    "right": [{ "type": "key_press", "key": "D", "duration_ms": 500 }],
+    "jump": [{ "type": "key_tap", "key": "SPACE" }],
+    "center_click": [{ "type": "mouse_click_at", "x": 0, "y": 0, "button": "left" }],
+    "look_up": [{ "type": "mouse_move", "dx": 0, "dy": -30 }],
+    "look_down": [{ "type": "mouse_move", "dx": 0, "dy": 30 }],
+    "look_left": [{ "type": "mouse_move", "dx": -200, "dy": 0 }],
+    "look_right": [{ "type": "mouse_move", "dx": 200, "dy": 0 }]
+  }
+}

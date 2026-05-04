@@ -15,9 +15,9 @@ This runner implements:
 from __future__ import annotations
 
 import argparse
-import importlib
-import inspect
 import os
+import shutil
+import sys
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 from pathlib import Path
@@ -25,9 +25,20 @@ import json
 import threading
 from collections import deque
 
-import keyboard
-import pyautogui
-import pydirectinput
+try:
+    import keyboard
+except BaseException:
+    keyboard = None
+
+try:
+    import pyautogui
+except BaseException:
+    pyautogui = None
+
+try:
+    import pydirectinput
+except BaseException:
+    pydirectinput = None
 
 import TwitchPlays_Connection
 from TwitchPlays_KeyCodes import *
@@ -35,23 +46,17 @@ from focus_gate import set_focus_target, is_target_focused
 
 ##################### STREAM / PLATFORM CONFIG #####################
 
-# Replace this with your Twitch username. Must be all lowercase.
-TWITCH_CHANNEL = os.environ.get("TWITCH_CHANNEL").lower()
+STREAM_CONFIG = TwitchPlays_Connection.load_twitchplays_config()
+
+TWITCH_CHANNEL = str(STREAM_CONFIG.get("twitch_channel") or "").strip().lower()
 
 # Sources: default to both Twitch and YouTube; YouTube is skipped gracefully
 # at runtime when not configured.
 STREAM_SOURCES = ["twitch", "youtube"]
 
-# If you're streaming on Youtube, replace this with your Youtube's Channel ID
-# Find this by clicking your Youtube profile pic -> Settings -> Advanced Settings
-YOUTUBE_CHANNEL_ID = os.environ.get("YOUTUBE_CHANNEL_ID")
-
-# YouTube Data API v3 key
-# Automatically falls back to scraping when quota is reached.
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
-
-# If you're using an Unlisted stream to test on Youtube, replace "None" below with your stream's URL in quotes.
-YOUTUBE_STREAM_URL = os.environ.get("YOUTUBE_STREAM_URL") or None
+YOUTUBE_CHANNEL_ID = str(STREAM_CONFIG.get("youtube_channel_id") or "").strip() or None
+YOUTUBE_API_KEY = str(STREAM_CONFIG.get("youtube_api_key") or "").strip() or None
+YOUTUBE_STREAM_URL = str(STREAM_CONFIG.get("youtube_stream_url") or "").strip() or None
 
 ##################### MESSAGE QUEUE VARIABLES #####################
 
@@ -62,6 +67,7 @@ VOTE_WINDOW_SEC = 3.0
 # Caps and limits
 MAX_VOTES_PER_WINDOW = 200
 MAX_MESSAGE_LENGTH = 64
+MOUSE_COORD_LIMIT = 100.0
 # Global minimum gap between executed winners (milliseconds)
 MIN_EXECUTION_GAP_MS = 300
 # Circuit breaker: on >=3 errors within 10s, auto soft-disable
@@ -76,8 +82,13 @@ STARTUP_COUNTDOWN = int("5")
 
 # Select game implementation
 DEFAULT_GAME = "gta5"
+PROFILE_DIR = Path(__file__).parent / "profiles"
+PROFILE_TEMPLATE_PATH = PROFILE_DIR / "template.json"
 
-pyautogui.FAILSAFE = False
+if pyautogui is not None:
+    pyautogui.FAILSAFE = False
+if pydirectinput is not None and hasattr(pydirectinput, "FAILSAFE"):
+    pydirectinput.FAILSAFE = False
 
 
 HELD_KEYS: set[int] = set()
@@ -105,20 +116,65 @@ def release(keycode: int) -> None:
     HELD_KEYS.discard(keycode)
 
 
+def load_mouse_backend():
+    if sys.platform == "win32" and pydirectinput is not None:
+        return ("pydirectinput", pydirectinput)
+    if pyautogui is not None:
+        return ("pyautogui", pyautogui)
+    raise RuntimeError(
+        "Mouse input requires pyautogui on Linux/macOS or pyautogui/pydirectinput on Windows."
+    )
+
+
 def mouse_down(btn: str = "left"):
-    pydirectinput.mouseDown(button=btn)
+    backend = load_mouse_backend()[1]
+    backend.mouseDown(button=btn)
 
 
 def mouse_up(btn: str = "left"):
-    pydirectinput.mouseUp(button=btn)
+    backend = load_mouse_backend()[1]
+    backend.mouseUp(button=btn)
 
 
 def mouse_click(btn: str = "left"):
-    pydirectinput.click(button=btn)
+    backend = load_mouse_backend()[1]
+    backend.click(button=btn)
+
+
+def mouse_move_to(x: int, y: int):
+    backend = load_mouse_backend()[1]
+    backend.moveTo(x, y)
 
 
 def mouse_move(dx: int = 0, dy: int = 0):
-    pydirectinput.moveRel(dx, dy, relative=True)
+    backend_name, backend = load_mouse_backend()
+    if backend_name == "pydirectinput":
+        backend.moveRel(dx, dy, relative=True)
+        return
+    backend.moveRel(dx, dy)
+
+
+def screen_size() -> Tuple[int, int]:
+    if pyautogui is None:
+        raise RuntimeError("pyautogui is required for mouse_click_at screen coordinates.")
+    size = pyautogui.size()
+    return int(size.width), int(size.height)
+
+
+def clamp_number(value: float, low: float, high: float) -> float:
+    return min(high, max(low, value))
+
+
+def point_for_normalized_mouse_coordinate(x_value: float, y_value: float) -> Tuple[int, int]:
+    width, height = screen_size()
+    center_x = (width - 1) / 2.0
+    center_y = (height - 1) / 2.0
+    x = center_x + (clamp_number(x_value, -MOUSE_COORD_LIMIT, MOUSE_COORD_LIMIT) / MOUSE_COORD_LIMIT) * center_x
+    y = center_y + (clamp_number(y_value, -MOUSE_COORD_LIMIT, MOUSE_COORD_LIMIT) / MOUSE_COORD_LIMIT) * center_y
+    return (
+        int(round(clamp_number(x, 0, width - 1))),
+        int(round(clamp_number(y, 0, height - 1))),
+    )
 
 
 def release_all() -> None:
@@ -135,76 +191,37 @@ def release_all() -> None:
     # Mouse buttons (best-effort)
     for b in ("left", "right", "middle"):
         try:
-            pydirectinput.mouseUp(button=b)
+            mouse_up(b)
         except Exception:
             pass
 
 
 ##########################################################
-# Game plugin system
+# Game profile system
 ##########################################################
 
 
-class BaseGame:
-    """Base class for games. Subclasses should register chat commands with @command.
-
-    Each handler is a function (self, username: str) -> None and may inspect
-    any additional context by reading instance variables.
-    """
-
+class ProfileGame:
     # mapping of chat message -> callable
     commands: Dict[str, Callable[[str], None]]
 
-    def __init__(self):
+    def __init__(self, profile: dict):
         self.commands = {}
+        aliases: Dict[str, str] = {
+            (k or "").strip().lower(): (v or "").strip().lower()
+            for k, v in (profile.get("aliases") or {}).items()
+            if (k or "").strip() and (v or "").strip()
+        }
+        self.canonical_to_macros: Dict[str, list] = profile.get("macros") or {}
 
-    def handle_message(self, username: str, msg: str):
-        key = msg.strip().lower()
-        handler = self.commands.get(key)
-        if handler:
-            handler(username)
-        else:
-            # Unknown command; override if you want different behavior
-            pass
+        def make_handler(canonical: str):
+            def handler(user: str) -> None:
+                execute_macro(self.canonical_to_macros.get(canonical) or [])
 
-    @classmethod
-    def game_name(cls) -> str:
-        # default: class name minus trailing "Game"
-        n = cls.__name__
-        return n[:-4].lower() if n.endswith("Game") else n.lower()
+            return handler
 
-
-def command(*aliases: str):
-    """Decorator to register a chat command on a BaseGame subclass method.
-
-    Usage:
-        class MyGame(BaseGame):
-            @command("left", "l")
-            def go_left(self, user):
-                ...
-    """
-
-    def decorator(func: Callable[[BaseGame, str], None]):
-        setattr(func, "twitch_aliases", [a.strip().lower() for a in aliases])
-        return func
-
-    return decorator
-
-
-def build_command_table(game: BaseGame):
-    for temp, method in inspect.getmembers(game, predicate=inspect.ismethod):
-        aliases = getattr(method, "twitch_aliases", None)
-        if aliases:
-            for a in aliases:
-                if a in game.commands:
-                    raise ValueError(f"Duplicate command alias: {a}")
-                game.commands[a] = method
-
-
-#########################################
-# Built-in games have been removed in favor of JSON profiles.
-# Use profiles/<game>.json, or provide a plugin module (see select_game).
-#########################################
+        for alias, canonical in aliases.items():
+            self.commands[alias] = make_handler(canonical)
 
 
 class MultiChat:
@@ -253,32 +270,21 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def select_game(key: str) -> BaseGame:
-    key = key.strip().lower()
-    # Attempt dynamic import path like "games.gta5:GTA5Game" or "my_mod:CustomGame"
-    if ":" in key:
-        module_name, class_name = key.split(":", 1)
-    else:
-        module_name, class_name = key, None
-    try:
-        mod = importlib.import_module(module_name)
-        cls = None
-        if class_name:
-            cls = getattr(mod, class_name)
-        else:
-            for temp, c in inspect.getmembers(mod, inspect.isclass):
-                if issubclass(c, BaseGame) and c is not BaseGame:
-                    cls = c
-                    break
-        if not cls:
-            raise ImportError("No BaseGame subclass found in module")
-        game = cls()
-        if not isinstance(game, BaseGame):
-            raise TypeError("Selected class is not a BaseGame subclass")
-        build_command_table(game)
-        return game
-    except Exception as e:
-        raise SystemExit(f"Failed to load game '{key}': {e}")
+def profile_path_for_game(game_key: str) -> Path:
+    key = game_key.strip()
+    if not key or "/" in key or "\\" in key:
+        raise SystemExit("--game must be a profile name, not a path.")
+    if key.endswith(".json"):
+        raise SystemExit("Use --game without .json, for example --game minecraft.")
+    return PROFILE_DIR / f"{key}.json"
+
+
+def create_profile_from_template(profile_path: Path) -> None:
+    if not PROFILE_TEMPLATE_PATH.exists():
+        raise SystemExit(f"Profile template not found at {PROFILE_TEMPLATE_PATH}.")
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(PROFILE_TEMPLATE_PATH, profile_path)
+    print(f"Created starter profile: profiles/{profile_path.name}")
 
 
 """Mutable runtime state."""
@@ -314,6 +320,22 @@ def main():
     args = parse_args()
     global last_exec_ts, injection_enabled
 
+    profile_path = profile_path_for_game(args.game)
+    if not profile_path.exists():
+        create_profile_from_template(profile_path)
+
+    game = select_profile_game(profile_path)
+    print(f"Loaded profile: {profile_path.name} with {len(game.commands)} commands")
+    # Configure focus target from profile
+    try:
+        with open(profile_path, "r", encoding="utf-8") as f:
+            prof = json.load(f)
+        proc = prof.get("target_process")
+        title = prof.get("window_title_contains")
+        set_focus_target(process_name=proc, title_contains=title)
+    except Exception:
+        set_focus_target(process_name=None, title_contains=None)
+
     # countdown so you can focus the game window, etc.
     countdown = args.countdown
     while countdown > 0:
@@ -326,6 +348,8 @@ def main():
     y = None
 
     if "twitch" in sources:
+        if not TWITCH_CHANNEL:
+            raise SystemExit("TWITCH_CHANNEL is required when Twitch chat is enabled.")
         t = TwitchPlays_Connection.Twitch()
         t.twitch_connect(TWITCH_CHANNEL)
     if "youtube" in sources:
@@ -345,35 +369,10 @@ def main():
 
     client = MultiChat(t, y)
 
-    # Profiles-first: prefer JSON profile; fallback to dynamic import module.
-    profile_path = Path(__file__).parent / "profiles" / f"{args.game}.json"
-    if profile_path.exists():
-        game = select_profile_game(profile_path)
-        print(f"Loaded profile: {profile_path.name} with {len(game.commands)} commands")
-        # Configure focus target from profile
-        try:
-            with open(profile_path, "r", encoding="utf-8") as f:
-                prof = json.load(f)
-            proc = prof.get("target_process")
-            title = prof.get("window_title_contains")
-            set_focus_target(process_name=proc, title_contains=title)
-        except Exception:
-            set_focus_target(process_name=None, title_contains=None)
-    else:
-        # Try dynamic plugin module as a fallback
-        try:
-            game = select_game(args.game)
-            print(
-                f"Loaded plugin: {game.__class__.__name__} (key='{args.game}') with {len(game.commands)} commands"
-            )
-            set_focus_target(process_name=None, title_contains=None)
-        except SystemExit as e:
-            raise SystemExit(
-                f"No profile found at profiles/{args.game}.json and no plugin module available for '{args.game}'."
-            )
-
     # Hotkeys
     try:
+        if keyboard is None:
+            raise RuntimeError("keyboard package is not installed")
         keyboard.add_hotkey(TOGGLE_HOTKEY, toggle_injection, suppress=False)
         keyboard.add_hotkey(KILL_HOTKEY, lambda: os._exit(0), suppress=False)
         print(f"Soft toggle: {TOGGLE_HOTKEY} | Hard kill: {KILL_HOTKEY}")
@@ -590,29 +589,12 @@ def keycode_from_name(name: str) -> Optional[int]:
         "9": NINE,
         "0": ZERO,
         ".": PERIOD,
+        "NUMPAD_4": NUMPAD_4,
+        "NUMPAD_5": NUMPAD_5,
+        "NUMPAD_6": NUMPAD_6,
+        "NUMPAD_8": NUMPAD_8,
     }
     return mapping.get(n)
-
-
-class ProfileGame(BaseGame):
-    def __init__(self, profile: dict):
-        super().__init__()
-        self.profile = profile
-        aliases: Dict[str, str] = {
-            (k or "").strip().lower(): (v or "").strip().lower()
-            for k, v in (profile.get("aliases") or {}).items()
-            if (k or "").strip() and (v or "").strip()
-        }
-        self.canonical_to_macros: Dict[str, list] = profile.get("macros") or {}
-
-        def make_handler(canonical: str):
-            def handler(user: str) -> None:
-                execute_macro(self.canonical_to_macros.get(canonical) or [])
-
-            return handler
-
-        for alias, canonical in aliases.items():
-            self.commands[alias] = make_handler(canonical)
 
 
 def execute_macro(steps: list) -> None:
@@ -621,7 +603,9 @@ def execute_macro(steps: list) -> None:
         if not isinstance(step, dict):
             continue
         t = str(step.get("type") or "").lower()
-        if t == "key_press":
+        if t == "parallel":
+            execute_parallel_threads(step.get("threads") or [])
+        elif t == "key_press":
             kc = keycode_from_name(str(step.get("key") or ""))
             ms = min(MAX_MS, max(0, int(step.get("duration_ms") or 0)))
             if kc and ms:
@@ -662,7 +646,14 @@ def execute_macro(steps: list) -> None:
         elif t == "mouse_click":
             b = str(step.get("button") or "left").lower()
             mouse_click(b)
-        elif t == "mouse_pulse":
+        elif t == "mouse_click_at":
+            x, y = point_for_normalized_mouse_coordinate(
+                float(step.get("x") or 0), float(step.get("y") or 0)
+            )
+            mouse_move_to(x, y)
+            b = str(step.get("button") or "left").lower()
+            mouse_click(b)
+        elif t in {"mouse_hold", "mouse_pulse"}:
             b = str(step.get("button") or "left").lower()
             ms = min(MAX_MS, max(0, int(step.get("duration_ms") or 0)))
             mouse_down(b)
@@ -675,12 +666,44 @@ def execute_macro(steps: list) -> None:
             mouse_move(dx, dy)
 
 
-def select_profile_game(path: Path) -> BaseGame:
+def normalize_parallel_thread(thread) -> list:
+    if isinstance(thread, list):
+        return thread
+    if isinstance(thread, dict):
+        return [thread]
+    return []
+
+
+def execute_parallel_threads(thread_specs: list) -> None:
+    errors = []
+    running_threads = []
+
+    def run_thread(thread_steps: list) -> None:
+        try:
+            execute_macro(thread_steps)
+        except Exception as exc:
+            errors.append(exc)
+
+    for thread_spec in thread_specs:
+        thread_steps = normalize_parallel_thread(thread_spec)
+        if not thread_steps:
+            continue
+        thread = threading.Thread(target=run_thread, args=(thread_steps,))
+        thread.start()
+        running_threads.append(thread)
+
+    for thread in running_threads:
+        thread.join()
+
+    if errors:
+        raise RuntimeError(f"Parallel macro thread failed: {errors[0]}")
+
+
+def select_profile_game(path: Path) -> ProfileGame:
     with open(path, "r", encoding="utf-8") as f:
         prof = json.load(f)
-    game = ProfileGame(prof)
-    build_command_table(game)
-    return game
+    return ProfileGame(prof)
+
 
 if __name__ == "__main__":
     main()

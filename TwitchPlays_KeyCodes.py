@@ -2,9 +2,11 @@
 # This code contains key codes plus functions to press keys on Windows
 # You should not need to modify anything in this file, just use as is.
 
+import sys
 import time
-import ctypes
-from ctypes import wintypes
+
+
+IS_WINDOWS = sys.platform == "win32"
 
 #############################################################
 #################### DIRECT X KEY CODES #####################
@@ -119,100 +121,185 @@ MOUSE7 = 0x107
 MOUSE_WHEEL_UP = 0x108
 MOUSE_WHEEL_DOWN = 0x109
 
+key_name_by_code = {
+    Q: "q",
+    W: "w",
+    E: "e",
+    R: "r",
+    T: "t",
+    Y: "y",
+    U: "u",
+    I: "i",
+    O: "o",
+    P: "p",
+    A: "a",
+    S: "s",
+    D: "d",
+    F: "f",
+    G: "g",
+    H: "h",
+    J: "j",
+    K: "k",
+    L: "l",
+    Z: "z",
+    X: "x",
+    C: "c",
+    V: "v",
+    B: "b",
+    N: "n",
+    M: "m",
+    LEFT_ARROW: "left",
+    RIGHT_ARROW: "right",
+    UP_ARROW: "up",
+    DOWN_ARROW: "down",
+    ESC: "esc",
+    ONE: "1",
+    TWO: "2",
+    THREE: "3",
+    FOUR: "4",
+    FIVE: "5",
+    SIX: "6",
+    SEVEN: "7",
+    EIGHT: "8",
+    NINE: "9",
+    ZERO: "0",
+    BACKSPACE: "backspace",
+    TAB: "tab",
+    ENTER: "enter",
+    LEFT_CONTROL: "ctrlleft",
+    RIGHT_CONTROL: "ctrlright",
+    LEFT_ALT: "altleft",
+    RIGHT_ALT: "altright",
+    LEFT_SHIFT: "shiftleft",
+    RIGHT_SHIFT: "shiftright",
+    SPACE: "space",
+    PERIOD: ".",
+    F1: "f1",
+    F2: "f2",
+    F3: "f3",
+    F4: "f4",
+    F5: "f5",
+    F6: "f6",
+    F7: "f7",
+    F8: "f8",
+    F9: "f9",
+    F10: "f10",
+    F11: "f11",
+    F12: "f12",
+}
+
+
+def key_name_from_code(hexKeyCode: int) -> str:
+    try:
+        return key_name_by_code[hexKeyCode]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported key code for non-Windows input: {hexKeyCode}") from exc
+
+
+def load_pyautogui():
+    try:
+        import pyautogui
+    except BaseException as exc:
+        raise RuntimeError(
+            "pyautogui is required for Twitch Plays input injection on Linux/macOS."
+        ) from exc
+    pyautogui.FAILSAFE = False
+    return pyautogui
+
 
 #############################################################
 ################## DIRECT INPUT FUNCTIONS ###################
 #############################################################
 
-KEYEVENTF_EXTENDEDKEY = 0x0001
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_SCANCODE = 0x0008
+if IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes
 
-# Structures for SendInput
-# Correct ULONG_PTR as an integer-sized pointer, not a pointer type
-if ctypes.sizeof(ctypes.c_void_p) == 8:
-    ULONG_PTR = ctypes.c_ulonglong
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_SCANCODE = 0x0008
+
+    # Structures for SendInput
+    # Correct ULONG_PTR as an integer-sized pointer, not a pointer type
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        ULONG_PTR = ctypes.c_ulonglong
+    else:
+        ULONG_PTR = ctypes.c_ulong
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ULONG_PTR),
+        ]
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ULONG_PTR),
+        ]
+
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD),
+            ("wParamH", wintypes.WORD),
+        ]
+
+    class INPUTUNION(ctypes.Union):
+        _fields_ = [
+            ("ki", KEYBDINPUT),
+            ("mi", MOUSEINPUT),
+            ("hi", HARDWAREINPUT),
+        ]
+
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = [
+            ("type", wintypes.DWORD),
+            ("u", INPUTUNION),
+        ]
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    SendInput = user32.SendInput
+    SendInput.restype = wintypes.UINT
+    SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+
+    def send_key(scan_code: int, flags: int) -> None:
+        ki = KEYBDINPUT(
+            wVk=0,
+            wScan=scan_code & 0xFFFF,
+            dwFlags=flags,
+            time=0,
+            dwExtraInfo=ULONG_PTR(0),
+        )
+        inp = INPUT(type=1, u=INPUTUNION(ki=ki))
+        n = SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        if n != 1:
+            try:
+                err = ctypes.get_last_error()
+            except Exception:
+                err = None
+            # Print only on failure to avoid noisy logs
+            print(f"SendInput failed (scan=0x{scan_code:X} flags=0x{flags:X}) err={err}")
+
+    def HoldKey(hexKeyCode: int) -> None:
+        send_key(hexKeyCode, KEYEVENTF_SCANCODE)
+
+    def ReleaseKey(hexKeyCode: int) -> None:
+        send_key(hexKeyCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP)
 else:
-    ULONG_PTR = ctypes.c_ulong
+    def HoldKey(hexKeyCode: int) -> None:
+        load_pyautogui().keyDown(key_name_from_code(hexKeyCode))
 
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ULONG_PTR),
-    ]
-
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", wintypes.LONG),
-        ("dy", wintypes.LONG),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ULONG_PTR),
-    ]
-
-
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [
-        ("uMsg", wintypes.DWORD),
-        ("wParamL", wintypes.WORD),
-        ("wParamH", wintypes.WORD),
-    ]
-
-
-class _INPUTUNION(ctypes.Union):
-    _fields_ = [
-        ("ki", KEYBDINPUT),
-        ("mi", MOUSEINPUT),
-        ("hi", HARDWAREINPUT),
-    ]
-
-
-class INPUT(ctypes.Structure):
-    _anonymous_ = ("u",)
-    _fields_ = [
-        ("type", wintypes.DWORD),
-        ("u", _INPUTUNION),
-    ]
-
-
-# Bind SendInput with last-error tracking so we can debug failures
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-SendInput = _user32.SendInput
-SendInput.restype = wintypes.UINT
-SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
-
-
-def send_key(scan_code: int, flags: int) -> None:
-    ki = KEYBDINPUT(
-        wVk=0,
-        wScan=scan_code & 0xFFFF,
-        dwFlags=flags,
-        time=0,
-        dwExtraInfo=ULONG_PTR(0),
-    )
-    inp = INPUT(type=1, u=_INPUTUNION(ki=ki))
-    n = SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
-    if n != 1:
-        try:
-            err = ctypes.get_last_error()
-        except Exception:
-            err = None
-        # Print only on failure to avoid noisy logs
-        print(f"SendInput failed (scan=0x{scan_code:X} flags=0x{flags:X}) err={err}")
-
-
-def HoldKey(hexKeyCode: int) -> None:
-    send_key(hexKeyCode, KEYEVENTF_SCANCODE)
-
-
-def ReleaseKey(hexKeyCode: int) -> None:
-    send_key(hexKeyCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP)
+    def ReleaseKey(hexKeyCode: int) -> None:
+        load_pyautogui().keyUp(key_name_from_code(hexKeyCode))
 
 
 # Holds down a key for the specified number of seconds

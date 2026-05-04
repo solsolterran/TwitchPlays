@@ -1,7 +1,8 @@
 fastapi
 uvicorn
 keyboard
-pydirectinput
+pydirectinput; platform_system == "Windows"
 pyautogui
 psutil
 requests
+websocket-client

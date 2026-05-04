@@ -1,5 +1,4 @@
 {
-  "name": "gta5",
   "target_process": "GTA5_Enhanced.exe",
   "window_title_contains": "Grand Theft Auto V",
 

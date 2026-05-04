@@ -1,5 +1,4 @@
 {
-        "name": "gta5_flying",
         "target_process": "gta5.exe",
         "window_title_contains": "Grand Theft Auto V",
 
@@ -37,11 +36,11 @@
                 "yaw_left":  [{ "type": "key_press", "key": "A",     "duration_ms": 250 }],
                 "yaw_right": [{ "type": "key_press", "key": "D",     "duration_ms": 250 }],
 
-                "roll_left":  [{ "type": "key_press", "key": "NUM4", "duration_ms": 250 }],
-                "roll_right": [{ "type": "key_press", "key": "NUM6", "duration_ms": 250 }],
+                "roll_left":  [{ "type": "key_press", "key": "NUMPAD_4", "duration_ms": 250 }],
+                "roll_right": [{ "type": "key_press", "key": "NUMPAD_6", "duration_ms": 250 }],
 
-                "pitch_up":   [{ "type": "key_press", "key": "NUM5", "duration_ms": 250 }],
-                "pitch_down": [{ "type": "key_press", "key": "NUM8", "duration_ms": 250 }],
+                "pitch_up":   [{ "type": "key_press", "key": "NUMPAD_5", "duration_ms": 250 }],
+                "pitch_down": [{ "type": "key_press", "key": "NUMPAD_8", "duration_ms": 250 }],
 
                 "gear": [{ "type": "key_tap", "key": "G" }],
                 "fire": [{ "type": "key_press", "key": "SPACE", "duration_ms": 120 }],
@@ -49,7 +48,7 @@
                 "cam":  [{ "type": "key_tap", "key": "V" }],
                 "plane_takeoff": [
                         { "type": "key_press", "key": "W",     "duration_ms": 1000 },
-                        { "type": "key_press", "key": "NUM5",  "duration_ms": 300 },
+                        { "type": "key_press", "key": "NUMPAD_5",  "duration_ms": 300 },
                         { "type": "key_tap",   "key": "G" }
                 ],
 
@@ -58,7 +57,7 @@
                 "heli_down":      [{ "type": "key_press", "key": "S",     "duration_ms": 400 }],
                 "heli_yaw_left":  [{ "type": "key_press", "key": "A",     "duration_ms": 250 }],
                 "heli_yaw_right": [{ "type": "key_press", "key": "D",     "duration_ms": 250 }],
-                "heli_forward":   [{ "type": "key_press", "key": "NUM8",  "duration_ms": 200 }],
-                "heli_back":      [{ "type": "key_press", "key": "NUM5",  "duration_ms": 200 }]
+                "heli_forward":   [{ "type": "key_press", "key": "NUMPAD_8",  "duration_ms": 200 }],
+                "heli_back":      [{ "type": "key_press", "key": "NUMPAD_5",  "duration_ms": 200 }]
         }
 }

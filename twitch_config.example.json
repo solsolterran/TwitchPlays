@@ -1,0 +1,10 @@
+{
+  "twitch_channel": "your_twitch_username",
+  "client_id": "From https://dev.twitch.tv/console/apps -> Client ID",
+  "client_secret": "Optional, but recommended for standard long-lived token refresh",
+  "access_token": "From the OAuth token response after authorizing the Twitch user with user:read:chat",
+  "refresh_token": "From the same OAuth token response that returned the access_token",
+  "youtube_channel_id": "",
+  "youtube_api_key": "",
+  "youtube_stream_url": ""
+}

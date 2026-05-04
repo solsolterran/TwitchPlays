@@ -1,16 +1,29 @@
 import concurrent.futures
 import os
-import random
-import keyboard
-import pydirectinput
-import pyautogui
+import sys
 import time
+
+try:
+    import keyboard
+except BaseException:
+    keyboard = None
+
+try:
+    import pydirectinput
+except BaseException:
+    pydirectinput = None
+
+try:
+    import pyautogui
+except BaseException:
+    pyautogui = None
+
 import TwitchPlays_Connection
 from TwitchPlays_KeyCodes import *
 
 ##################### GAME VARIABLES #####################
 
-# Replace this with your Twitch username. Must be all lowercase.
+# Replace this with your Twitch username.
 TWITCH_CHANNEL = "dougdougw"
 
 # If streaming on Youtube, set this to False
@@ -49,27 +62,51 @@ MAX_WORKERS = 32
 # minimal idle sleep to avoid 100% CPU when chat is quiet
 IDLE_SLEEP_SEC = 0.005
 
-last_time = time.time()
-message_queue = []
-thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
-active_tasks = []
-pyautogui.FAILSAFE = False
+if pyautogui is not None:
+    pyautogui.FAILSAFE = False
+if pydirectinput is not None and hasattr(pydirectinput, "FAILSAFE"):
+    pydirectinput.FAILSAFE = False
 
 ##########################################################
 
-# Count down before starting, so you have time to load up the game
-countdown = 5
-while countdown > 0:
-    print(countdown)
-    countdown -= 1
-    time.sleep(1)
 
-if STREAMING_ON_TWITCH:
-    t = TwitchPlays_Connection.Twitch()
-    t.twitch_connect(TWITCH_CHANNEL)
-else:
-    t = TwitchPlays_Connection.YouTube(api_key=YOUTUBE_API_KEY)
-    t.youtube_connect(YOUTUBE_CHANNEL_ID, YOUTUBE_STREAM_URL, api_key=YOUTUBE_API_KEY)
+def load_mouse_backend():
+    if sys.platform == "win32" and pydirectinput is not None:
+        return ("pydirectinput", pydirectinput)
+    if pyautogui is not None:
+        return ("pyautogui", pyautogui)
+    raise RuntimeError(
+        "Mouse input requires pyautogui on Linux/macOS or pydirectinput/pyautogui on Windows."
+    )
+
+
+def mouse_down(btn: str = "left") -> None:
+    load_mouse_backend()[1].mouseDown(button=btn)
+
+
+def mouse_up(btn: str = "left") -> None:
+    load_mouse_backend()[1].mouseUp(button=btn)
+
+
+def mouse_move(dx: int = 0, dy: int = 0) -> None:
+    backend_name, backend = load_mouse_backend()
+    if backend_name == "pydirectinput":
+        backend.moveRel(dx, dy, relative=True)
+        return
+    backend.moveRel(dx, dy)
+
+
+def connect_chat():
+    if STREAMING_ON_TWITCH:
+        client = TwitchPlays_Connection.Twitch()
+        client.twitch_connect(TWITCH_CHANNEL)
+        return client
+
+    client = TwitchPlays_Connection.YouTube(api_key=YOUTUBE_API_KEY)
+    client.youtube_connect(
+        YOUTUBE_CHANNEL_ID, YOUTUBE_STREAM_URL, api_key=YOUTUBE_API_KEY
+    )
+    return client
 
 
 def handle_message(message):
@@ -120,69 +157,81 @@ def handle_message(message):
 
         # Press the left mouse button down for 1 second, then release it
         elif msg == "shoot":
-            pydirectinput.mouseDown(button="left")
+            mouse_down("left")
             time.sleep(1)
-            pydirectinput.mouseUp(button="left")
+            mouse_up("left")
 
         # Move the mouse up by 30 pixels
         elif msg == "aim up":
-            pydirectinput.moveRel(0, -30, relative=True)
+            mouse_move(0, -30)
 
         # Move the mouse right by 200 pixels
         elif msg == "aim right":
-            pydirectinput.moveRel(200, 0, relative=True)
+            mouse_move(200, 0)
 
     except Exception as e:
         print("Encountered exception: " + str(e))
 
 
-try:
-    while True:
-        # compact finished tasks
-        active_tasks = [t for t in active_tasks if not t.done()]
+def main() -> None:
+    last_time = time.time()
+    message_queue = []
+    active_tasks = []
+    thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-        # Check for new messages
-        new_messages = t.twitch_receive_messages()
-        if new_messages:
-            message_queue += new_messages
-            # Keep only the most recent X messages
-            message_queue = message_queue[-MAX_QUEUE_LENGTH:]
+    countdown = 5
+    while countdown > 0:
+        print(countdown)
+        countdown -= 1
+        time.sleep(1)
 
-        messages_to_handle = []
-        if not message_queue:
-            last_time = time.time()
-            time.sleep(IDLE_SLEEP_SEC)  # prevent busy-spin when idle
-            continue
-        else:
-            # Determine how many messages we should handle now
+    t = connect_chat()
+
+    try:
+        while True:
+            active_tasks = [task for task in active_tasks if not task.done()]
+
+            new_messages = t.twitch_receive_messages()
+            if new_messages:
+                message_queue += new_messages
+                message_queue = message_queue[-MAX_QUEUE_LENGTH:]
+
+            messages_to_handle = []
+            if not message_queue:
+                last_time = time.time()
+                time.sleep(IDLE_SLEEP_SEC)
+                continue
+
             r = 1 if MESSAGE_RATE == 0 else (time.time() - last_time) / MESSAGE_RATE
             n = int(r * len(message_queue))
             if n > 0:
-                # Pop the messages we want off the front of the queue
                 messages_to_handle = message_queue[0:n]
                 del message_queue[0:n]
                 last_time = time.time()
 
-        # If user presses Shift+Backspace, automatically end the program
-        if keyboard.is_pressed("shift+backspace"):
-            break
+            if keyboard is not None and keyboard.is_pressed("shift+backspace"):
+                break
 
-        if not messages_to_handle:
-            time.sleep(IDLE_SLEEP_SEC)
-            continue
+            if not messages_to_handle:
+                time.sleep(IDLE_SLEEP_SEC)
+                continue
 
-        for message in messages_to_handle:
-            if len(active_tasks) < MAX_WORKERS:
-                active_tasks.append(thread_pool.submit(handle_message, message))
-            else:
-                print(
-                    f"WARNING: active tasks ({len(active_tasks)}) exceeds number of workers ({MAX_WORKERS}). ({len(message_queue)} messages in the queue)"
-                )
+            for message in messages_to_handle:
+                if len(active_tasks) < MAX_WORKERS:
+                    active_tasks.append(thread_pool.submit(handle_message, message))
+                else:
+                    print(
+                        f"WARNING: active tasks ({len(active_tasks)}) exceeds number of workers ({MAX_WORKERS}). ({len(message_queue)} messages in the queue)"
+                    )
 
-except KeyboardInterrupt:
-    pass
-finally:
-    try:
-        thread_pool.shutdown(wait=False, cancel_futures=True)
-    except Exception:
+    except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            thread_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
