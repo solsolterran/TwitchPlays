@@ -3,7 +3,7 @@ Anyone is free to use my version of TwitchPlays. Credit of some kind is apprecia
     - Haven't started streaming yet as of May 2026. Still making stuff and preparing.
   - https://x.com/SolSolTerra
   - https://www.youtube.com/@SolSolTerran
-  - https://github.com/solsolterran/TwitchPlays
+  - https://github.com/solsolterran/
 
 I wanted to update DougDoug's TwitchPlays code to use the modern eventsub Twitch API.
 I wanted to make this game agnostic. The core logic is independent of any specific game, so users only need to create JSON profiles that map chat commands to input actions or macros. Profiles can be swapped dynamically using command line flags, allowing different games to run under the same system without changing the underlying code. Once a profile defines the necessary keys, combinations, or sequences, everything is ready to go, with no need to modify the core program.
