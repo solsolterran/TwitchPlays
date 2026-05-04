@@ -119,22 +119,22 @@ Twitch API docs I found while researching:
 
 Changes I've made to DougDoug's original code:
 1. Game profiles
-  Why:
+  - Why:
     - I didn't like the idea of needing to hard code changes directly into the functions themselves. I'd originally thought of game specific functions but realized I ran into the same clutter and monolithic code Doug is famous for. This way games can be swapped easier with just a command line flag, commands/controls are easier to edit, more reliable and customizable, and it just looks nicer in my opinion.
     - I added aliases specifically to allow for more customization. Single words are easier for people to type in chat but may require more complex naming on the backend.
 2. Twitch Chat transport
-  Why:
+  - Why:
     - Twitch chat now reads through EventSub WebSockets instead of anonymous IRC parsing. `client_id`, `access_token`, and `refresh_token` replaced the old anonymous IRC login.
   - I didn't update youtube chat retrieval cause then I'd have to pay for queries. Still using scraping.
 3. Macros
-  Why:
+  - Why:
     - I liked the idea of chaining together commands/combos without chat needing to have complex commands they needed to type in chat. Better immersion imo.
   - Parallel command support so something like walking while shooting can be done together. This way mouse and key commands can be used together.
 4. Linux compatibility
-  Why:
+  - Why:
     - I use Linux. That's it.
     - Also gave me an opportunity to improve the focus gate and Windows OS usage.
 5. TwitchPlays Single
-  Why:
+  - Why:
     - I wanted a slower runner for turn-based games, browser games, menus, and click-heavy games where chat should vote on one action instead of constantly executing a stream of commands.
     - Click mode lets chat fight over a visible mouse target by spamming coordinates, while command mode reuses the same profile aliases and macros from the main runner for a single instance.
