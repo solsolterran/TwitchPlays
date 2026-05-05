@@ -9,6 +9,7 @@
 # Ignore the information above. Keeping it inside for nostalgia.
 
 import concurrent.futures
+import importlib
 import json
 import queue
 import re
@@ -19,14 +20,56 @@ import traceback
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Type
 
 import requests
 
+
+class FallbackWebSocketTimeoutException(Exception):
+    pass
+
+
+class FallbackWebSocketConnectionClosedException(Exception):
+    pass
+
+
 try:
-    import websocket
+    websocket_module: Any = importlib.import_module("websocket")
 except Exception:
-    websocket = None
+    websocket_module = None
+
+websocket_create_connection = getattr(websocket_module, "create_connection", None)
+WebSocketTimeoutException: Type[BaseException] = getattr(
+    websocket_module,
+    "WebSocketTimeoutException",
+    FallbackWebSocketTimeoutException,
+)
+WebSocketConnectionClosedException: Type[BaseException] = getattr(
+    websocket_module,
+    "WebSocketConnectionClosedException",
+    FallbackWebSocketConnectionClosedException,
+)
+
+if not callable(websocket_create_connection):
+    try:
+        core_module: Any = importlib.import_module("websocket._core")
+        exceptions_module: Any = importlib.import_module("websocket._exceptions")
+    except Exception:
+        websocket_create_connection = None
+    else:
+        websocket_create_connection = getattr(core_module, "create_connection", None)
+        WebSocketTimeoutException = getattr(
+            exceptions_module,
+            "WebSocketTimeoutException",
+            FallbackWebSocketTimeoutException,
+        )
+        WebSocketConnectionClosedException = getattr(
+            exceptions_module,
+            "WebSocketConnectionClosedException",
+            FallbackWebSocketConnectionClosedException,
+        )
+        if not callable(websocket_create_connection):
+            websocket_create_connection = None
 
 API_TIMEOUT_SECONDS = 10
 EVENTSUB_BACKOFF_MAX_SECONDS = 30
@@ -34,6 +77,7 @@ EVENTSUB_CHAT_MESSAGE_TYPE = "channel.chat.message"
 EVENTSUB_KEEPALIVE_GRACE_SECONDS = 5
 EVENTSUB_WEBSOCKET_URL = "wss://eventsub.wss.twitch.tv/ws"
 MAX_STORED_MESSAGE_IDS = 2048
+TOKEN_REFRESH_MARGIN_SECONDS = 300
 TWITCH_CONFIG_EXAMPLE_FILE_NAME = "twitch_config.example.json"
 TWITCH_CONFIG_FILE_NAME = "twitch_config.json"
 TWITCH_HELIX_SUBSCRIPTIONS_URL = "https://api.twitch.tv/helix/eventsub/subscriptions"
@@ -76,6 +120,7 @@ class TwitchSessionState:
     auth: Dict[str, str]
     chat_user_id: str
     broadcaster_user_id: str
+    token_refresh_at: Optional[float] = None
     message_queue: "queue.Queue[Dict[str, str]]" = field(default_factory=queue.Queue)
     seen_message_ids: Deque[str] = field(default_factory=deque)
     seen_message_id_lookup: Set[str] = field(default_factory=set)
@@ -95,9 +140,9 @@ class Twitch:
         self.reader_thread: Optional[threading.Thread] = None
 
     def twitch_connect(self, channel: str) -> None:
-        if websocket is None:
+        if websocket_create_connection is None:
             raise RuntimeError(
-                "Twitch EventSub requires websocket-client. Install it with `pip install -r requirements.txt`."
+                "Twitch EventSub requires websocket-client. Install it with `pip install -r requirements.txt`. If that is already installed, repair it with `python3 -m pip install --force-reinstall --no-cache-dir websocket-client`."
             )
 
         self.close()
@@ -110,12 +155,15 @@ class Twitch:
         auth = self.load_auth()
 
         print(f"Connecting to Twitch chat for {self.channel}...")
-        chat_user_id, broadcaster_user_id = self.resolve_twitch_ids(auth, self.channel)
+        chat_user_id, broadcaster_user_id, token_refresh_at = self.resolve_twitch_ids(
+            auth, self.channel
+        )
         session = TwitchSessionState(
             channel=self.channel,
             auth=auth,
             chat_user_id=chat_user_id,
             broadcaster_user_id=broadcaster_user_id,
+            token_refresh_at=token_refresh_at,
         )
         ws, keepalive_timeout = self.establish_eventsub_session(
             session, EVENTSUB_WEBSOCKET_URL, create_subscription=True
@@ -196,7 +244,9 @@ class Twitch:
             encoding="utf-8",
         )
 
-    def resolve_twitch_ids(self, auth: Dict[str, str], channel: str) -> Tuple[str, str]:
+    def resolve_twitch_ids(
+        self, auth: Dict[str, str], channel: str
+    ) -> Tuple[str, str, Optional[float]]:
         token_info = self.validate_user_token(auth)
         chat_user_id = str(token_info.get("user_id") or "").strip()
         if not chat_user_id:
@@ -208,7 +258,7 @@ class Twitch:
             raise RuntimeError(
                 f"Could not resolve a Twitch user ID for channel `{channel}`."
             )
-        return chat_user_id, broadcaster_user_id
+        return chat_user_id, broadcaster_user_id, self.next_token_refresh_at(token_info)
 
     def validate_user_token(self, auth: Dict[str, str]) -> Dict[str, Any]:
         response = requests.get(
@@ -223,12 +273,30 @@ class Twitch:
                 headers={"Authorization": f"OAuth {auth['access_token']}"},
                 timeout=API_TIMEOUT_SECONDS,
             )
+        data = self.parse_validated_token_response(auth, response)
+
+        if self.token_expires_soon(data):
+            self.refresh_access_token(auth)
+            response = requests.get(
+                TWITCH_OAUTH_VALIDATE_URL,
+                headers={"Authorization": f"OAuth {auth['access_token']}"},
+                timeout=API_TIMEOUT_SECONDS,
+            )
+            data = self.parse_validated_token_response(auth, response)
+
+        return data
+
+    def parse_validated_token_response(
+        self, auth: Dict[str, str], response: requests.Response
+    ) -> Dict[str, Any]:
         if not response.ok:
             raise RuntimeError(
                 f"Twitch token validation failed. {self.describe_response_error(response)}"
             )
 
         data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("Twitch token validation returned an invalid response.")
         validated_client_id = str(data.get("client_id") or "").strip()
         if validated_client_id != auth["client_id"]:
             raise RuntimeError(
@@ -240,8 +308,39 @@ class Twitch:
             raise RuntimeError(
                 f"Twitch access token is missing the `{TWITCH_READ_CHAT_SCOPE}` scope."
             )
-
         return data
+
+    def token_expires_soon(self, data: Dict[str, Any]) -> bool:
+        raw_expires_in = data.get("expires_in")
+        if raw_expires_in is None:
+            return False
+
+        try:
+            expires_in = int(raw_expires_in)
+        except (TypeError, ValueError):
+            return False
+
+        return expires_in <= TOKEN_REFRESH_MARGIN_SECONDS
+
+    def next_token_refresh_at(self, data: Dict[str, Any]) -> Optional[float]:
+        raw_expires_in = data.get("expires_in")
+        if raw_expires_in is None:
+            return None
+
+        try:
+            expires_in = int(raw_expires_in)
+        except (TypeError, ValueError):
+            return None
+
+        return time.time() + max(0, expires_in - TOKEN_REFRESH_MARGIN_SECONDS)
+
+    def refresh_token_if_due(self, session: TwitchSessionState) -> None:
+        if session.token_refresh_at is None or time.time() < session.token_refresh_at:
+            return
+
+        self.refresh_access_token(session.auth)
+        token_info = self.validate_user_token(session.auth)
+        session.token_refresh_at = self.next_token_refresh_at(token_info)
 
     def refresh_access_token(self, auth: Dict[str, str]) -> None:
         body = {
@@ -264,7 +363,16 @@ class Twitch:
             )
 
         data = response.json()
-        auth["access_token"] = str(data.get("access_token") or "").strip()
+        if not isinstance(data, dict):
+            raise RuntimeError("Twitch token refresh returned an invalid response.")
+
+        new_access_token = str(data.get("access_token") or "").strip()
+        if not new_access_token:
+            raise RuntimeError(
+                "Twitch token refresh response did not include an access_token."
+            )
+
+        auth["access_token"] = new_access_token
         new_refresh_token = str(data.get("refresh_token") or "").strip()
         if new_refresh_token:
             auth["refresh_token"] = new_refresh_token
@@ -350,7 +458,9 @@ class Twitch:
 
     def open_websocket(self, ws_url: str) -> Any:
         try:
-            ws = websocket.create_connection(
+            if websocket_create_connection is None:
+                raise RuntimeError("websocket-client is not available.")
+            ws = websocket_create_connection(
                 ws_url,
                 timeout=API_TIMEOUT_SECONDS,
                 enable_multithread=True,
@@ -367,7 +477,7 @@ class Twitch:
         while time.time() < deadline:
             try:
                 raw = ws.recv()
-            except websocket.WebSocketTimeoutException:
+            except WebSocketTimeoutException:
                 continue
             except Exception as exc:
                 raise RuntimeError(
@@ -428,15 +538,16 @@ class Twitch:
         while not session.stop_event.is_set():
             try:
                 while not session.stop_event.is_set():
+                    self.refresh_token_if_due(session)
                     try:
                         raw = ws.recv()
-                    except websocket.WebSocketTimeoutException:
+                    except WebSocketTimeoutException:
                         if time.time() > keepalive_deadline:
                             raise RuntimeError(
                                 "Timed out waiting for Twitch EventSub keepalive traffic."
                             )
                         continue
-                    except websocket.WebSocketConnectionClosedException as exc:
+                    except WebSocketConnectionClosedException as exc:
                         raise RuntimeError("Twitch EventSub websocket closed.") from exc
                     except Exception as exc:
                         raise RuntimeError(
@@ -516,6 +627,7 @@ class Twitch:
                     (
                         session.chat_user_id,
                         session.broadcaster_user_id,
+                        session.token_refresh_at,
                     ) = self.resolve_twitch_ids(session.auth, session.channel)
                     ws, keepalive_timeout = self.establish_eventsub_session(
                         session,
@@ -684,7 +796,7 @@ class YouTube:
     # ---------------------------
     def youtube_connect(
         self,
-        channel_id: str,
+        channel_id: Optional[str],
         stream_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> None:
@@ -694,6 +806,8 @@ class YouTube:
 
         self.channel_id = channel_id
         self.stream_url = stream_url
+        if not self.channel_id and not self.stream_url:
+            raise RuntimeError("YouTube requires either a channel ID or a stream URL.")
 
         if self.use_api:
             ok = self.api_connect()
@@ -917,7 +1031,7 @@ class YouTube:
         time.sleep(max(0.0, delay))
 
         # Attempt reconnect
-        if self.channel_id:
+        if self.channel_id or self.stream_url:
             # reconnect preserving mode
             if self.use_api:
                 self.api_connect()
@@ -1027,9 +1141,13 @@ class YouTube:
 
     def fetch_messages(self) -> List[Dict[str, Any]]:
         # scraper fetch (unchanged)
+        session = self.session
+        if session is None:
+            return []
+
         try:
             payload_bytes = bytes(json.dumps(self.payload), "utf8")
-            res = self.session.post(
+            res = session.post(
                 f"https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key={self.config['INNERTUBE_API_KEY']}&prettyPrint=false",
                 payload_bytes,
                 timeout=10,
@@ -1043,7 +1161,7 @@ class YouTube:
             print("Body:", res.text[:500])
             print("Payload:", payload_bytes)
             try:
-                self.session.close()
+                session.close()
             except Exception:
                 pass
             self.session = None
@@ -1133,10 +1251,12 @@ class YouTube:
                 res = []
             except Exception:
                 traceback.print_exc()
-                try:
-                    self.session.close()
-                except Exception:
-                    pass
+                session = self.session
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
                 self.session = None
                 return []
             else:

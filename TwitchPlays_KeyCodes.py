@@ -4,6 +4,7 @@
 
 import sys
 import time
+from typing import Any, Callable, Optional
 
 
 IS_WINDOWS = sys.platform == "win32"
@@ -266,7 +267,12 @@ if IS_WINDOWS:
             ("u", INPUTUNION),
         ]
 
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    WinDLL: Any = getattr(ctypes, "WinDLL")
+    get_last_error: Callable[[], Optional[int]] = getattr(
+        ctypes, "get_last_error", lambda: None
+    )
+
+    user32 = WinDLL("user32", use_last_error=True)
     SendInput = user32.SendInput
     SendInput.restype = wintypes.UINT
     SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
@@ -282,10 +288,7 @@ if IS_WINDOWS:
         inp = INPUT(type=1, u=INPUTUNION(ki=ki))
         n = SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
         if n != 1:
-            try:
-                err = ctypes.get_last_error()
-            except Exception:
-                err = None
+            err = get_last_error()
             # Print only on failure to avoid noisy logs
             print(f"SendInput failed (scan=0x{scan_code:X} flags=0x{flags:X}) err={err}")
 

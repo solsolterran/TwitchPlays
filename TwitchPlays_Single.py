@@ -45,7 +45,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import pyautogui
@@ -401,7 +401,7 @@ def release(keycode: int) -> None:
     HELD_KEYS.discard(keycode)
 
 
-def load_mouse_backend() -> Tuple[str, object]:
+def load_mouse_backend() -> Tuple[str, Any]:
     if sys.platform == "win32" and pydirectinput is not None:
         return ("pydirectinput", pydirectinput)
     if pyautogui is not None:

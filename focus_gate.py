@@ -20,7 +20,7 @@ import ctypes
 import re
 import shutil
 import subprocess
-from typing import Optional
+from typing import Any, Optional
 
 import psutil
 
@@ -146,7 +146,8 @@ def is_target_focused() -> bool:
 
     if is_windows():
         try:
-            user32 = ctypes.windll.user32
+            windll: Any = getattr(ctypes, "windll")
+            user32 = windll.user32
             GetForegroundWindow = user32.GetForegroundWindow
             GetWindowTextLengthW = user32.GetWindowTextLengthW
             GetWindowTextW = user32.GetWindowTextW

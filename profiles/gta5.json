@@ -1,5 +1,5 @@
 {
-  "target_process": "GTA5_Enhanced.exe",
+  "target_process": "gta5.exe",
   "window_title_contains": "Grand Theft Auto V",
 
   "aliases": {

@@ -247,6 +247,26 @@ class MultiChat:
             out.append({"message": msg.lower(), "username": user.lower()})
         return out
 
+    def close(self) -> None:
+        if self.t:
+            try:
+                self.t.close()
+            except Exception:
+                pass
+        if self.y:
+            session = getattr(self.y, "session", None)
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            thread_pool = getattr(self.y, "thread_pool", None)
+            if thread_pool is not None:
+                try:
+                    thread_pool.shutdown(wait=False)
+                except Exception:
+                    pass
+
 
 ##########################################################
 # Runtime
@@ -268,6 +288,18 @@ def parse_args() -> argparse.Namespace:
         help="Separated chat sources: twitch,youtube",
     )
     return p.parse_args()
+
+
+def parse_sources(raw_value: str) -> List[str]:
+    sources = [
+        source.strip().lower() for source in raw_value.split(",") if source.strip()
+    ]
+    if not sources:
+        raise SystemExit("--sources must include twitch, youtube, or both.")
+    for source in sources:
+        if source not in {"twitch", "youtube"}:
+            raise SystemExit("--sources must only include twitch or youtube.")
+    return sources
 
 
 def profile_path_for_game(game_key: str) -> Path:
@@ -343,24 +375,30 @@ def main():
         countdown -= 1
         time.sleep(1)
 
-    sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
+    sources = parse_sources(args.sources)
     t = None
     y = None
 
-    if "twitch" in sources:
-        if not TWITCH_CHANNEL:
-            raise SystemExit("TWITCH_CHANNEL is required when Twitch chat is enabled.")
-        t = TwitchPlays_Connection.Twitch()
-        t.twitch_connect(TWITCH_CHANNEL)
-    if "youtube" in sources:
-        # Only connect to YouTube if configuration is present
-        if YOUTUBE_CHANNEL_ID or YOUTUBE_STREAM_URL:
-            y = TwitchPlays_Connection.YouTube(api_key=YOUTUBE_API_KEY)
-            y.youtube_connect(
-                YOUTUBE_CHANNEL_ID, YOUTUBE_STREAM_URL, api_key=YOUTUBE_API_KEY
-            )
-        else:
-            y = None
+    try:
+        if "twitch" in sources:
+            if not TWITCH_CHANNEL:
+                raise SystemExit(
+                    "TWITCH_CHANNEL is required when Twitch chat is enabled."
+                )
+            t = TwitchPlays_Connection.Twitch()
+            t.twitch_connect(TWITCH_CHANNEL)
+        if "youtube" in sources:
+            # Only connect to YouTube if configuration is present
+            if YOUTUBE_CHANNEL_ID or YOUTUBE_STREAM_URL:
+                y = TwitchPlays_Connection.YouTube(api_key=YOUTUBE_API_KEY)
+                y.youtube_connect(
+                    YOUTUBE_CHANNEL_ID, YOUTUBE_STREAM_URL, api_key=YOUTUBE_API_KEY
+                )
+            else:
+                y = None
+    except BaseException:
+        MultiChat(t, y).close()
+        raise
 
     if not t and not y:
         raise SystemExit(
@@ -476,29 +514,33 @@ def main():
                     now_s = time.time()
                     if (now_s - last_exec_ts) * 1000.0 < MIN_EXECUTION_GAP_MS:
                         reason = "global_gap"
-                    try:
-                        handler = game.commands.get(winner)
-                        if handler:
-                            print(f"Executing '{winner}'")
-                            handler("vote")
-                            # immediate reset
-                            release_all()
-                            executed = True
-                            # record last execution time
-                            last_exec_ts = time.time()
-                    except Exception as e:
-                        reason = f"error:{e}"
-                        now_s = time.time()
-                        error_times.append(now_s)
-                        # prune
-                        while error_times and now_s - error_times[0] > ERROR_WINDOW_SEC:
-                            error_times.popleft()
-                        if len(error_times) >= ERROR_TRIP_THRESHOLD:
-                            injection_enabled = False
-                            release_all()
-                            print(
-                                f"Circuit breaker tripped to prevent fatal issues. Too many errors triggered."
-                            )
+                    else:
+                        try:
+                            handler = game.commands.get(winner)
+                            if handler:
+                                print(f"Executing '{winner}'")
+                                handler("vote")
+                                # immediate reset
+                                release_all()
+                                executed = True
+                                # record last execution time
+                                last_exec_ts = time.time()
+                        except Exception as e:
+                            reason = f"error:{e}"
+                            now_s = time.time()
+                            error_times.append(now_s)
+                            # prune
+                            while (
+                                error_times
+                                and now_s - error_times[0] > ERROR_WINDOW_SEC
+                            ):
+                                error_times.popleft()
+                            if len(error_times) >= ERROR_TRIP_THRESHOLD:
+                                injection_enabled = False
+                                release_all()
+                                print(
+                                    f"Circuit breaker tripped to prevent fatal issues. Too many errors triggered."
+                                )
 
             # Summary line
             total_votes = sum(counts.values())
@@ -517,9 +559,14 @@ def main():
             counts.clear()
             last_ts_by_cmd.clear()
             unknown = 0
+    except KeyboardInterrupt:
+        print("Stopping Twitch Plays Every Game.")
     except Exception:
         print("fatal error in main loop")
         raise
+    finally:
+        release_all()
+        client.close()
 
 
 def keycode_from_name(name: str) -> Optional[int]:

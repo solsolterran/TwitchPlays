@@ -1,0 +1,14 @@
+{
+  "target_process": "",
+  "window_title_contains": "SuperTux",
+  "aliases": {
+    "forward": "forward",
+    "back": "back",
+    "jump": "jump"
+  },
+  "macros": {
+    "forward": [{ "type": "key_press", "key": "RIGHT_ARROW", "duration_ms": 1500 }],
+    "back": [{ "type": "key_press", "key": "LEFT_ARROW", "duration_ms": 1500 }],
+    "jump": [{ "type": "key_tap", "key": "SPACE" }]
+  }
+}

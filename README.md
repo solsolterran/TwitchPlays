@@ -32,6 +32,7 @@ Linux notes
 - Linux focus gating is supported on `X11` via `xprop` (`x11-utils` on Debian/Ubuntu).
 - Run inside a graphical desktop session. X11 works best.
 - Global hotkeys still depend on the `keyboard` package and may require higher permissions.
+- Use `sudo -E "$(which python3)" TwitchPlays_Everything.py --game supertux`
 
 Profiles
 - Fields:
@@ -101,7 +102,7 @@ Notes
 - If you're using windows then you need to run this as Administrator. If you're on Linux then use `sudo`.
 - Twitch chat reads use EventSub over WebSockets and keep the old `twitch_connect(...)` and `twitch_receive_messages()` interface.
 - `twitch_config.json` is the one local config file for Twitch auth, Twitch channel, and optional YouTube settings.
-- The app validates the saved Twitch token on startup and refreshes it when Twitch returns `401`, so users should not need to re-authorize every 4 hours.
+- The app validates the saved Twitch token on startup, refreshes shortly before expiration, and refreshes again if Twitch returns `401`, so users should not need to re-authorize every 4 hours.
 - If `client_secret` is omitted, refresh behavior depends on the kind of Twitch token you originally created. For the least user friction, include `client_secret`.
 - Voting: fixed window `3s`, cap `200` messages per window, max message length `64`.
 - Focus gate: configured via `profiles/<game>.json` (`target_process`, `window_title_contains`).
