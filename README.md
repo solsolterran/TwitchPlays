@@ -17,6 +17,7 @@ Quick Start
   - `client_secret` - optional, but recommended if you want the standard long-lived Twitch refresh flow.
   - `access_token` - lets this app read Twitch chat through EventSub. Get it from the Twitch OAuth token response.
   - `refresh_token` - gets a new `access_token` when the old one expires. It comes from the same Twitch OAuth token response.
+
   Optional:
   - `youtube_channel_id` - Your YouTube Channel ID, not your handle.
   - `youtube_stream_url` - Direct URL of the live video for unlisted or specific streams.
