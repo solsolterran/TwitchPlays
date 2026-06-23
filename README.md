@@ -1,7 +1,7 @@
 Anyone is free to use my version of TwitchPlays. Credit of some kind is appreciated but not necessary.
   - https://www.twitch.tv/solsolterran
     - Haven't started streaming yet as of May 2026. Still making stuff and preparing.
-  - https://x.com/SolSolTerra
+  - https://x.com/SolSolTerran
   - https://www.youtube.com/@SolSolTerran
   - https://github.com/solsolterran/
 
