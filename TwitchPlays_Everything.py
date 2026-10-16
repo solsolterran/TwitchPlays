@@ -7,21 +7,21 @@ $ python TwitchPlays_Everything.py --game gta5
 
 This runner implements:
     - 3s voting window with per-user dedupe
-    - Soft kill toggle that stops inputs (Alt+Shift+P by default) and hard kill that stops program (Ctrl+Shift+Backspace)
-    - Windows focus gate (via profile `target_process` / `window_title_contains`)
+    - Input toggle (Alt+Shift+P) and stop with cleanup (Ctrl+Shift+Backspace)
+    - Windows/Linux X11 focus gate (via profile `target_process` / `window_title_contains`)
     - Immediate reset: commands are pulses, followed by release_all()
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import sys
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 from pathlib import Path
 import json
+import math
 import threading
 from collections import deque
 
@@ -46,17 +46,7 @@ from focus_gate import set_focus_target, is_target_focused
 
 ##################### STREAM / PLATFORM CONFIG #####################
 
-STREAM_CONFIG = TwitchPlays_Connection.load_twitchplays_config()
-
-TWITCH_CHANNEL = str(STREAM_CONFIG.get("twitch_channel") or "").strip().lower()
-
-# Sources: default to both Twitch and YouTube; YouTube is skipped gracefully
-# at runtime when not configured.
 STREAM_SOURCES = ["twitch", "youtube"]
-
-YOUTUBE_CHANNEL_ID = str(STREAM_CONFIG.get("youtube_channel_id") or "").strip() or None
-YOUTUBE_API_KEY = str(STREAM_CONFIG.get("youtube_api_key") or "").strip() or None
-YOUTUBE_STREAM_URL = str(STREAM_CONFIG.get("youtube_stream_url") or "").strip() or None
 
 ##################### MESSAGE QUEUE VARIABLES #####################
 
@@ -91,31 +81,6 @@ if pydirectinput is not None and hasattr(pydirectinput, "FAILSAFE"):
     pydirectinput.FAILSAFE = False
 
 
-HELD_KEYS: set[int] = set()
-
-
-def press_and_release(keycode: int, seconds: float = 0.1) -> None:
-    """Press and release a key for N seconds, tracking holds for cleanup."""
-    try:
-        HELD_KEYS.add(keycode)
-        HoldKey(keycode)
-        time.sleep(max(0.01, float(seconds)))
-    finally:
-        ReleaseKey(keycode)
-        HELD_KEYS.discard(keycode)
-
-
-def press_hold(keycode: int) -> None:
-    """Hold a key (tracked). Intended for short pulses in this runner."""
-    HELD_KEYS.add(keycode)
-    HoldKey(keycode)
-
-
-def release(keycode: int) -> None:
-    ReleaseKey(keycode)
-    HELD_KEYS.discard(keycode)
-
-
 def load_mouse_backend():
     if sys.platform == "win32" and pydirectinput is not None:
         return ("pydirectinput", pydirectinput)
@@ -126,37 +91,28 @@ def load_mouse_backend():
     )
 
 
-def mouse_down(btn: str = "left"):
-    backend = load_mouse_backend()[1]
-    backend.mouseDown(button=btn)
-
-
-def mouse_up(btn: str = "left"):
-    backend = load_mouse_backend()[1]
-    backend.mouseUp(button=btn)
-
-
-def mouse_click(btn: str = "left"):
-    backend = load_mouse_backend()[1]
-    backend.click(button=btn)
-
-
 def mouse_move_to(x: int, y: int):
-    backend = load_mouse_backend()[1]
-    backend.moveTo(x, y)
+    with input_lock:
+        check_input_allowed()
+        backend = load_mouse_backend()[1]
+        backend.moveTo(x, y)
 
 
 def mouse_move(dx: int = 0, dy: int = 0):
-    backend_name, backend = load_mouse_backend()
-    if backend_name == "pydirectinput":
-        backend.moveRel(dx, dy, relative=True)
-        return
-    backend.moveRel(dx, dy)
+    with input_lock:
+        check_input_allowed()
+        backend_name, backend = load_mouse_backend()
+        if backend_name == "pydirectinput":
+            backend.moveRel(dx, dy, relative=True)
+            return
+        backend.moveRel(dx, dy)
 
 
 def screen_size() -> Tuple[int, int]:
     if pyautogui is None:
-        raise RuntimeError("pyautogui is required for mouse_click_at screen coordinates.")
+        raise RuntimeError(
+            "pyautogui is required for mouse_click_at screen coordinates."
+        )
     size = pyautogui.size()
     return int(size.width), int(size.height)
 
@@ -165,35 +121,32 @@ def clamp_number(value: float, low: float, high: float) -> float:
     return min(high, max(low, value))
 
 
-def point_for_normalized_mouse_coordinate(x_value: float, y_value: float) -> Tuple[int, int]:
+def point_for_normalized_mouse_coordinate(
+    x_value: float, y_value: float
+) -> Tuple[int, int]:
     width, height = screen_size()
     center_x = (width - 1) / 2.0
     center_y = (height - 1) / 2.0
-    x = center_x + (clamp_number(x_value, -MOUSE_COORD_LIMIT, MOUSE_COORD_LIMIT) / MOUSE_COORD_LIMIT) * center_x
-    y = center_y + (clamp_number(y_value, -MOUSE_COORD_LIMIT, MOUSE_COORD_LIMIT) / MOUSE_COORD_LIMIT) * center_y
+    x = (
+        center_x
+        + (
+            clamp_number(x_value, -MOUSE_COORD_LIMIT, MOUSE_COORD_LIMIT)
+            / MOUSE_COORD_LIMIT
+        )
+        * center_x
+    )
+    y = (
+        center_y
+        + (
+            clamp_number(y_value, -MOUSE_COORD_LIMIT, MOUSE_COORD_LIMIT)
+            / MOUSE_COORD_LIMIT
+        )
+        * center_y
+    )
     return (
         int(round(clamp_number(x, 0, width - 1))),
         int(round(clamp_number(y, 0, height - 1))),
     )
-
-
-def release_all() -> None:
-    """Release all tracked key holds and mouse buttons."""
-    try:
-        for k in list(HELD_KEYS):
-            try:
-                ReleaseKey(k)
-            except Exception:
-                pass
-            HELD_KEYS.discard(k)
-    except Exception:
-        pass
-    # Mouse buttons (best-effort)
-    for b in ("left", "right", "middle"):
-        try:
-            mouse_up(b)
-        except Exception:
-            pass
 
 
 ##########################################################
@@ -201,11 +154,304 @@ def release_all() -> None:
 ##########################################################
 
 
+input_lock = threading.RLock()
+cancel_event = threading.Event()
+stop_event = threading.Event()
+held_inputs: set[tuple] = set()
+persistent_inputs: set[tuple] = set()
+temporary_inputs: dict[tuple, int] = {}
+input_active = False
+cleanup_failed = False
+
+
+class MacroCancelled(RuntimeError):
+    pass
+
+
+def cancel_input() -> None:
+    with input_lock:
+        cancel_event.set()
+
+
+def request_stop() -> None:
+    with input_lock:
+        stop_event.set()
+        cancel_event.set()
+
+
+def check_input_allowed() -> None:
+    if stop_event.is_set() or cancel_event.is_set():
+        raise MacroCancelled("Input was cancelled.")
+    if cleanup_failed:
+        raise RuntimeError("Input remains stopped because a previous release failed.")
+    if not injection_enabled:
+        raise MacroCancelled("Input is disabled.")
+    if not is_target_focused():
+        cancel_event.set()
+        raise MacroCancelled("The configured game window lost focus.")
+
+
+def begin_input() -> None:
+    global input_active
+    with input_lock:
+        if input_active or held_inputs:
+            raise RuntimeError("The previous input sequence has not finished cleanup.")
+        cancel_event.clear()
+        check_input_allowed()
+        input_active = True
+
+
+def send_input(kind: str, value, pressed: bool) -> None:
+    if kind == "key":
+        (HoldKey if pressed else ReleaseKey)(value)
+    else:
+        backend = load_mouse_backend()[1]
+        (backend.mouseDown if pressed else backend.mouseUp)(button=value)
+
+
+def acquire_input(kind: str, value, persistent: bool = False) -> None:
+    item = (kind, value)
+    with input_lock:
+        check_input_allowed()
+        if persistent:
+            persistent_inputs.add(item)
+        else:
+            temporary_inputs[item] = temporary_inputs.get(item, 0) + 1
+        if item not in held_inputs:
+            # Track before sending: a failed backend call may still have pressed it.
+            held_inputs.add(item)
+            send_input(kind, value, True)
+
+
+def release_input(kind: str, value, persistent: bool = False) -> None:
+    global cleanup_failed
+    item = (kind, value)
+    with input_lock:
+        if persistent:
+            persistent_inputs.discard(item)
+        elif temporary_inputs.get(item, 0) > 0:
+            temporary_inputs[item] -= 1
+            if not temporary_inputs[item]:
+                del temporary_inputs[item]
+        if (
+            item in persistent_inputs
+            or item in temporary_inputs
+            or item not in held_inputs
+        ):
+            return
+        try:
+            send_input(kind, value, False)
+        except Exception:
+            cleanup_failed = True
+            cancel_event.set()
+            raise
+        held_inputs.remove(item)
+
+
+def wait_for_input(seconds: float) -> None:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        with input_lock:
+            check_input_allowed()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        cancel_event.wait(min(remaining, 0.05))
+
+
+def hold_inputs(items: list[tuple], seconds: float) -> None:
+    acquired = []
+    try:
+        for kind, value in items:
+            acquire_input(kind, value)
+            acquired.append((kind, value))
+        wait_for_input(seconds)
+    finally:
+        for kind, value in acquired:
+            release_input(kind, value)
+
+
+def press_and_release(keycode: int, seconds: float = 0.1) -> None:
+    hold_inputs([("key", keycode)], max(0.01, seconds))
+
+
+def press_hold(keycode: int) -> None:
+    acquire_input("key", keycode, persistent=True)
+
+
+def release(keycode: int) -> None:
+    release_input("key", keycode, persistent=True)
+
+
+def mouse_down(button: str = "left") -> None:
+    acquire_input("mouse", button, persistent=True)
+
+
+def mouse_up(button: str = "left") -> None:
+    release_input("mouse", button, persistent=True)
+
+
+def mouse_click(button: str = "left") -> None:
+    hold_inputs([("mouse", button)], 0.01)
+
+
+def release_all() -> bool:
+    global cleanup_failed
+    with input_lock:
+        for kind, value in list(held_inputs):
+            try:
+                send_input(kind, value, False)
+            except Exception as exc:
+                print(f"Could not release {kind} {value}: {exc}")
+            else:
+                held_inputs.remove((kind, value))
+        persistent_inputs.clear()
+        temporary_inputs.clear()
+        cleanup_failed = bool(held_inputs)
+        if cleanup_failed:
+            cancel_event.set()
+        return not cleanup_failed
+
+
+def run_macro(steps: list, expected_vote_generation: Optional[int] = None) -> None:
+    global input_active
+    validate_steps(steps, "macro")
+    with input_lock:
+        if (
+            expected_vote_generation is not None
+            and expected_vote_generation != vote_generation
+        ):
+            raise MacroCancelled("The vote was discarded when input was toggled.")
+        begin_input()
+    try:
+        execute_macro(steps)
+    finally:
+        cancel_input()
+        released = release_all()
+        input_active = False
+        if not released:
+            raise RuntimeError(
+                "Input remains stopped because cleanup could not release every input."
+            )
+
+
+def validate_steps(steps: list, location: str) -> None:
+    if not isinstance(steps, list):
+        raise ValueError(f"{location}: macro steps must be a list.")
+    for index, step in enumerate(steps):
+        where = f"{location}, step {index + 1}"
+        if not isinstance(step, dict) or not isinstance(step.get("type"), str):
+            raise ValueError(f"{where}: each step needs a type.")
+        kind = step["type"].lower()
+        if kind not in {
+            "parallel",
+            "key_press",
+            "key_tap",
+            "key_hold",
+            "key_release",
+            "key_combo",
+            "mouse_down",
+            "mouse_up",
+            "mouse_click",
+            "mouse_click_at",
+            "mouse_hold",
+            "mouse_pulse",
+            "mouse_move",
+        }:
+            raise ValueError(f"{where}: unknown step type {kind!r}.")
+        if kind == "parallel":
+            threads = step.get("threads")
+            if not isinstance(threads, list) or not threads:
+                raise ValueError(f"{where}: parallel needs a nonempty threads list.")
+            for branch, thread in enumerate(threads):
+                validate_steps(
+                    [thread] if isinstance(thread, dict) else thread,
+                    f"{where}, branch {branch + 1}",
+                )
+        elif kind.startswith("key_"):
+            if kind == "key_combo" or (kind == "key_release" and "keys" in step):
+                names = step.get("keys")
+                if not isinstance(names, list):
+                    raise ValueError(f"{where}: keys must be a list.")
+            else:
+                names = [step.get("key")]
+            for name in names:
+                code = keycode_from_name(name) if isinstance(name, str) else None
+                if code is None:
+                    raise ValueError(f"{where}: unsupported key {name!r}.")
+                if not IS_WINDOWS:
+                    try:
+                        key_name_from_code(code)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{where}: key {name!r} is unsupported on this platform."
+                        ) from exc
+        elif kind != "mouse_move":
+            button = step.get("button", "left")
+            if not isinstance(button, str) or button.lower() not in {
+                "left",
+                "right",
+                "middle",
+            }:
+                raise ValueError(f"{where}: unsupported mouse button {button!r}.")
+        for field in ("duration_ms", "x", "y", "dx", "dy"):
+            if field in step:
+                value = step[field]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                ):
+                    raise ValueError(f"{where}: {field} must be a finite number.")
+
+
+def validate_profile(profile: dict, location: str) -> dict:
+    if not isinstance(profile, dict):
+        raise ValueError(f"{location}: profile must be a JSON object.")
+    for field in ("target_process", "window_title_contains"):
+        if profile.get(field) is not None and not isinstance(profile[field], str):
+            raise ValueError(f"{location}: {field} must be a string or null.")
+    aliases = profile.get("aliases", {})
+    macros = profile.get("macros", {})
+    if not isinstance(aliases, dict) or not isinstance(macros, dict):
+        raise ValueError(f"{location}: aliases and macros must be objects.")
+    normalized_macros = {}
+    for name, steps in macros.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{location}: macro names must be nonempty strings.")
+        canonical = name.strip().lower()
+        if canonical in normalized_macros:
+            raise ValueError(f"{location}: duplicate normalized macro {canonical!r}.")
+        validate_steps(steps, f"{location}, macro {name!r}")
+        normalized_macros[canonical] = steps
+    normalized_aliases = {}
+    for alias, canonical in aliases.items():
+        if (
+            not isinstance(alias, str)
+            or not alias.strip()
+            or not isinstance(canonical, str)
+        ):
+            raise ValueError(
+                f"{location}: aliases must map nonempty strings to macro names."
+            )
+        alias, canonical = alias.strip().lower(), canonical.strip().lower()
+        if alias in normalized_aliases:
+            raise ValueError(f"{location}: duplicate normalized alias {alias!r}.")
+        if not normalized_macros.get(canonical):
+            raise ValueError(
+                f"{location}: alias {alias!r} refers to missing or empty macro {canonical!r}."
+            )
+        normalized_aliases[alias] = canonical
+    return {**profile, "aliases": normalized_aliases, "macros": normalized_macros}
+
+
 class ProfileGame:
     # mapping of chat message -> callable
     commands: Dict[str, Callable[[str], None]]
 
     def __init__(self, profile: dict):
+        profile = validate_profile(profile, "profile")
+        self.profile = profile
         self.commands = {}
         aliases: Dict[str, str] = {
             (k or "").strip().lower(): (v or "").strip().lower()
@@ -216,7 +462,7 @@ class ProfileGame:
 
         def make_handler(canonical: str):
             def handler(user: str) -> None:
-                execute_macro(self.canonical_to_macros.get(canonical) or [])
+                run_macro(self.canonical_to_macros[canonical])
 
             return handler
 
@@ -225,52 +471,127 @@ class ProfileGame:
 
 
 class MultiChat:
-    def __init__(self, twitch=None, youtube=None):
-        self.t = twitch
-        self.y = youtube
+    def __init__(self, twitch_client=None, youtube_client=None):
+        self.twitch_client = twitch_client
+        self.youtube_client = youtube_client
 
-    def receive_messages(self):
-        msgs = []
-        if self.t:
-            msgs.extend(self.t.twitch_receive_messages())
-        if self.y:
-            msgs.extend(self.y.twitch_receive_messages())
-        # normalize once here and filter message length
-        out = []
-        for m in msgs:
-            msg = (m.get("message") or "").strip()
-            user = (m.get("username") or "").strip()
-            if not msg or not user:
+    @property
+    def available(self) -> bool:
+        return any(
+            client.connected and not client.stopped
+            for client in (self.twitch_client, self.youtube_client)
+            if client
+        )
+
+    @property
+    def finished(self) -> bool:
+        return all(
+            client.stopped
+            for client in (self.twitch_client, self.youtube_client)
+            if client
+        )
+
+    def receive_messages(self) -> List[dict]:
+        messages = []
+        for platform, client in (
+            ("twitch", self.twitch_client),
+            ("youtube", self.youtube_client),
+        ):
+            if client is None:
                 continue
-            if len(msg) > MAX_MESSAGE_LENGTH:
-                continue
-            out.append({"message": msg.lower(), "username": user.lower()})
-        return out
+            for message in client.twitch_receive_messages():
+                text = str(message.get("message") or "").strip()
+                username = str(message.get("username") or "").strip()
+                if username and 0 < len(text) <= MAX_MESSAGE_LENGTH:
+                    messages.append(
+                        {
+                            **message,
+                            "platform": platform,
+                            "message": text.lower(),
+                            "username": username,
+                        }
+                    )
+        messages.sort(key=lambda message: message.get("received_at", 0))
+        if len(messages) > MAX_VOTES_PER_WINDOW:
+            print(
+                f"Discarded {len(messages) - MAX_VOTES_PER_WINDOW} messages because the combined chat batch was full."
+            )
+        return messages[:MAX_VOTES_PER_WINDOW]
 
     def close(self) -> None:
-        if self.t:
+        for platform, client in (
+            ("Twitch", self.twitch_client),
+            ("YouTube", self.youtube_client),
+        ):
+            if client is not None:
+                try:
+                    client.close()
+                except Exception as exc:
+                    print(
+                        f"Could not close the {platform} chat reader ({type(exc).__name__})."
+                    )
+
+
+def connect_chat(sources: List[str]) -> MultiChat:
+    stream_config = TwitchPlays_Connection.load_twitchplays_config()
+    twitch_client = None
+    youtube_client = None
+    try:
+        if "twitch" in sources:
+            twitch_channel = str(stream_config.get("twitch_channel") or "").strip()
+            if not twitch_channel:
+                raise ValueError(
+                    "twitch_channel is required when Twitch chat is selected."
+                )
+            twitch_client = TwitchPlays_Connection.Twitch(
+                message_limit=MAX_VOTES_PER_WINDOW
+            )
             try:
-                self.t.close()
-            except Exception:
-                pass
-        if self.y:
-            session = getattr(self.y, "session", None)
-            if session is not None:
+                twitch_client.twitch_connect(twitch_channel)
+            except (RuntimeError, OSError) as exc:
+                twitch_client.stopped = True
+                detail = (
+                    str(exc)
+                    if isinstance(exc, TwitchPlays_Connection.TwitchRevocationError)
+                    else type(exc).__name__
+                )
+                print(
+                    f"Twitch chat could not start: {detail}. Check the channel and Twitch authorization in twitch_config.json."
+                )
+        if "youtube" in sources:
+            channel_id = (
+                str(stream_config.get("youtube_channel_id") or "").strip() or None
+            )
+            stream_url = (
+                str(stream_config.get("youtube_stream_url") or "").strip() or None
+            )
+            api_key = str(stream_config.get("youtube_api_key") or "").strip() or None
+            if channel_id or stream_url:
+                youtube_client = TwitchPlays_Connection.YouTube(
+                    api_key=api_key, message_limit=MAX_VOTES_PER_WINDOW
+                )
                 try:
-                    session.close()
-                except Exception:
-                    pass
-            thread_pool = getattr(self.y, "thread_pool", None)
-            if thread_pool is not None:
-                try:
-                    thread_pool.shutdown(wait=False)
-                except Exception:
-                    pass
-
-
-##########################################################
-# Runtime
-##########################################################
+                    youtube_client.youtube_connect(
+                        channel_id, stream_url, api_key=api_key
+                    )
+                except (
+                    TwitchPlays_Connection.ChatEndedError,
+                    TwitchPlays_Connection.YouTubeAuthorizationError,
+                ) as exc:
+                    print(f"YouTube chat could not start. {exc}")
+                except (RuntimeError, OSError, ValueError, KeyError) as exc:
+                    print(
+                        f"YouTube chat could not connect ({type(exc).__name__}); the reader will retry."
+                    )
+        chat = MultiChat(twitch_client, youtube_client)
+        if chat.finished:
+            raise RuntimeError(
+                "No chat source can run. Check twitch_config.json and --sources."
+            )
+        return chat
+    except BaseException:
+        MultiChat(twitch_client, youtube_client).close()
+        raise
 
 
 def parse_args() -> argparse.Namespace:
@@ -319,254 +640,228 @@ def create_profile_from_template(profile_path: Path) -> None:
     print(f"Created starter profile: profiles/{profile_path.name}")
 
 
-"""Mutable runtime state."""
 injection_enabled = False
-input_mode = "chat"  # "chat" or "external"
-# Circuit breaker rolling window of error timestamps
+input_mode = "chat"
 error_times: deque[float] = deque()
-# Global last execution time (seconds)
-last_exec_ts: float = 0.0
-
-# hotkeys (configurable)
+last_exec_ts = 0.0
 TOGGLE_HOTKEY = "alt+shift+p"
 KILL_HOTKEY = "ctrl+shift+backspace"
-
 last_toggle_ts = 0.0
 DEBOUNCE_SEC = 0.25
+hotkey_handles = []
+hotkeys_ready = False
+vote_generation = 0
+
+# Preserve the existing in-process external-message hook.
+tp_external_sink = deque(maxlen=MAX_VOTES_PER_WINDOW)
+tp_external_lock = threading.Lock()
+tp_allow_set = set()
+tp_input_mode_ref = lambda: input_mode
 
 
-def toggle_injection():
-    global injection_enabled, last_toggle_ts
-    now = time.time()
-    if now - last_toggle_ts < DEBOUNCE_SEC:
-        return
-    last_toggle_ts = now
-    injection_enabled = not injection_enabled
-    state = "ENABLED" if injection_enabled else "DISABLED"
-    print(f"Injection {state}.")
-    if not injection_enabled:
-        release_all()
+def receive_votes(client: MultiChat) -> list:
+    if input_mode == "chat":
+        return client.receive_messages()
+    with tp_external_lock:
+        incoming = list(tp_external_sink)
+        tp_external_sink.clear()
+    now = time.monotonic()
+    return [
+        {**item, "platform": "external", "received_at": item.get("received_at", now)}
+        for item in incoming
+    ]
 
 
-def main():
+def toggle_injection() -> None:
+    global injection_enabled, last_toggle_ts, vote_generation
+    with input_lock:
+        now = time.monotonic()
+        if now - last_toggle_ts < DEBOUNCE_SEC:
+            return
+        last_toggle_ts = now
+        if not hotkeys_ready or stop_event.is_set() or cleanup_failed:
+            print(
+                "Input cannot be enabled until hotkeys and input cleanup are working."
+            )
+            return
+        injection_enabled = not injection_enabled
+        vote_generation += 1
+        if not injection_enabled:
+            cancel_event.set()
+        print(f"Input {'enabled' if injection_enabled else 'disabled'}.")
+
+
+def register_hotkeys() -> None:
+    global hotkeys_ready, injection_enabled
+    try:
+        if keyboard is None:
+            raise RuntimeError("The keyboard package is not installed.")
+        hotkey_handles.append(
+            keyboard.add_hotkey(TOGGLE_HOTKEY, toggle_injection, suppress=False)
+        )
+        hotkey_handles.append(
+            keyboard.add_hotkey(KILL_HOTKEY, request_stop, suppress=False)
+        )
+    except Exception as exc:
+        injection_enabled = False
+        cancel_input()
+        unregister_hotkeys()
+        raise RuntimeError(
+            "Hotkeys could not be registered. Check keyboard installation and desktop permissions; input remains disabled."
+        ) from exc
+    hotkeys_ready = True
+    print(f"Toggle input: {TOGGLE_HOTKEY}. Stop and release input: {KILL_HOTKEY}.")
+
+
+def unregister_hotkeys() -> None:
+    global hotkeys_ready
+    hotkeys_ready = False
+    for handle in hotkey_handles:
+        try:
+            keyboard.remove_hotkey(handle)
+        except Exception as exc:
+            print(f"Could not remove a TwitchPlays hotkey ({type(exc).__name__}).")
+    hotkey_handles.clear()
+
+
+def collect_votes(client: MultiChat, game: ProfileGame):
+    start, start_wall = time.monotonic(), time.time()
+    end = start + VOTE_WINDOW_SEC
+    generation = vote_generation
+    votes = {}
+    seen_messages = set()
+    processed = unknown = discarded = 0
+    while time.monotonic() < end and not stop_event.is_set():
+        incoming = receive_votes(client)
+        if (
+            not injection_enabled
+            or vote_generation != generation
+            or (input_mode == "chat" and not client.available)
+        ):
+            return None
+        for message in incoming:
+            if not TwitchPlays_Connection.message_in_window(
+                message, start, end, start_wall
+            ):
+                continue
+            text = str(message.get("message") or "").strip().lower()
+            username = str(message.get("username") or "").strip()
+            if not username or not text or len(text) > MAX_MESSAGE_LENGTH:
+                continue
+            platform = message.get("platform", "external")
+            message_id = message.get("message_id")
+            identity = (platform, message.get("user_id") or username.lower())
+            if message_id and (platform, message_id) in seen_messages:
+                continue
+            if processed >= MAX_VOTES_PER_WINDOW:
+                discarded += 1
+                continue
+            processed += 1
+            if message_id:
+                seen_messages.add((platform, message_id))
+            if text not in game.commands:
+                unknown += 1
+                continue
+            # Messages in a YouTube batch share a receipt timestamp.
+            recency = (message.get("received_at", time.monotonic()), processed)
+            votes[identity] = (text, recency)
+        stop_event.wait(IDLE_SLEEP_SEC)
+    if (
+        stop_event.is_set()
+        or not injection_enabled
+        or vote_generation != generation
+        or (input_mode == "chat" and not client.available)
+    ):
+        return None
+    counts, latest = {}, {}
+    for command, recency in votes.values():
+        counts[command] = counts.get(command, 0) + 1
+        latest[command] = max(recency, latest.get(command, recency))
+    if discarded:
+        print(
+            f"Discarded {discarded} messages after the {MAX_VOTES_PER_WINDOW}-message vote limit."
+        )
+    winner = (
+        max(counts, key=lambda command: (counts[command], latest[command]))
+        if counts
+        else None
+    )
+    return winner, len(votes), unknown, generation
+
+
+def main() -> None:
+    global injection_enabled, last_exec_ts, tp_allow_set
     args = parse_args()
-    global last_exec_ts, injection_enabled
-
+    sources = parse_sources(args.sources)
     profile_path = profile_path_for_game(args.game)
     if not profile_path.exists():
         create_profile_from_template(profile_path)
-
     game = select_profile_game(profile_path)
-    print(f"Loaded profile: {profile_path.name} with {len(game.commands)} commands")
-    # Configure focus target from profile
+    set_focus_target(
+        game.profile.get("target_process"), game.profile.get("window_title_contains")
+    )
+    tp_allow_set = set(game.commands)
+    print(f"Loaded profile: {profile_path.name} with {len(game.commands)} commands.")
+    client = None
     try:
-        with open(profile_path, "r", encoding="utf-8") as f:
-            prof = json.load(f)
-        proc = prof.get("target_process")
-        title = prof.get("window_title_contains")
-        set_focus_target(process_name=proc, title_contains=title)
-    except Exception:
-        set_focus_target(process_name=None, title_contains=None)
-
-    # countdown so you can focus the game window, etc.
-    countdown = args.countdown
-    while countdown > 0:
-        print(countdown)
-        countdown -= 1
-        time.sleep(1)
-
-    sources = parse_sources(args.sources)
-    t = None
-    y = None
-
-    try:
-        if "twitch" in sources:
-            if not TWITCH_CHANNEL:
-                raise SystemExit(
-                    "TWITCH_CHANNEL is required when Twitch chat is enabled."
-                )
-            t = TwitchPlays_Connection.Twitch()
-            t.twitch_connect(TWITCH_CHANNEL)
-        if "youtube" in sources:
-            # Only connect to YouTube if configuration is present
-            if YOUTUBE_CHANNEL_ID or YOUTUBE_STREAM_URL:
-                y = TwitchPlays_Connection.YouTube(api_key=YOUTUBE_API_KEY)
-                y.youtube_connect(
-                    YOUTUBE_CHANNEL_ID, YOUTUBE_STREAM_URL, api_key=YOUTUBE_API_KEY
-                )
-            else:
-                y = None
-    except BaseException:
-        MultiChat(t, y).close()
-        raise
-
-    if not t and not y:
-        raise SystemExit(
-            "No valid chat sources. Use --sources twitch,youtube or set STREAM_SOURCES."
-        )
-
-    client = MultiChat(t, y)
-
-    # Hotkeys
-    try:
-        if keyboard is None:
-            raise RuntimeError("keyboard package is not installed")
-        keyboard.add_hotkey(TOGGLE_HOTKEY, toggle_injection, suppress=False)
-        keyboard.add_hotkey(KILL_HOTKEY, lambda: os._exit(0), suppress=False)
-        print(f"Soft toggle: {TOGGLE_HOTKEY} | Hard kill: {KILL_HOTKEY}")
-    except Exception as e:
-        print(f"Hotkeys unavailable: {e}")
-
-    # Voting window state
-    window_end = time.time() + VOTE_WINDOW_SEC
-    last_vote_by_user: Dict[str, Tuple[str, float]] = {}
-    counts: Dict[str, int] = {}
-    last_ts_by_cmd: Dict[str, float] = {}
-    unknown = 0
-
-    # Precompute allowlist (commands)
-    allow = set(game.commands.keys())
-
-    # external messages input (P1)
-    external_messages: List[dict] = []
-    external_lock = threading.Lock()
-
-    def drain_external() -> List[dict]:
-        with external_lock:
-            out = list(external_messages)
-            external_messages.clear()
-            return out
-
-    # expose for API
-    globals()["tp_external_sink"] = external_messages
-    globals()["tp_external_lock"] = external_lock
-    globals()["tp_allow_set"] = allow
-    globals()["tp_input_mode_ref"] = lambda: input_mode
-
-    print("Press soft toggle to enable listening.")
-
-    try:
-        while True:
-
-            # Read messages
-            incoming = []
-            # Chat messages only if mode == chat
-            if input_mode == "chat":
-                msgs = client.receive_messages() or []
-                incoming.extend(msgs)
-            # If input is coming from API rather than chat
-            if input_mode == "external":
-                incoming.extend(drain_external())
-
-            for m in incoming:
-                msg = m.get("message") or ""
-                user = m.get("username") or ""
-                if not msg or not user:
-                    continue
-                if len(counts) + unknown >= MAX_VOTES_PER_WINDOW:
-                    continue
-                if msg not in allow:
-                    unknown += 1
-                    continue
-                now = time.time()
-                prev = last_vote_by_user.get(user)
-                if prev:
-                    prev_cmd, _ = prev
-                    if prev_cmd == msg:
-                        # no change
-                        last_vote_by_user[user] = (msg, now)
-                        last_ts_by_cmd[msg] = now
-                        continue
-                    # decrement previous
-                    counts[prev_cmd] = max(0, counts.get(prev_cmd, 0) - 1)
-                # add/update
-                last_vote_by_user[user] = (msg, now)
-                counts[msg] = counts.get(msg, 0) + 1
-                last_ts_by_cmd[msg] = now
-
-            now = time.time()
-            if now < window_end:
-                time.sleep(IDLE_SLEEP_SEC)
+        register_hotkeys()
+        for remaining in range(max(0, args.countdown), 0, -1):
+            print(remaining)
+            if stop_event.wait(1):
+                return
+        client = connect_chat(sources)
+        print("Press the input toggle to start voting.")
+        while not stop_event.is_set():
+            # Discard anything received outside a voting window; keep polling YouTube.
+            receive_votes(client)
+            if input_mode == "chat" and client.finished:
+                print("All configured chat sources have stopped.")
+                break
+            if not injection_enabled or (input_mode == "chat" and not client.available):
+                stop_event.wait(0.05)
                 continue
-
-            # Select winner (max count; tie => latest last vote)
-            winner = None
-            if counts:
-                max_count = max(counts.values())
-                top = [cmd for cmd, c in counts.items() if c == max_count]
-                if len(top) == 1:
-                    winner = top[0]
-                else:
-                    # choose the tied command with most recent last ts
-                    winner = max(top, key=lambda c: last_ts_by_cmd.get(c, 0.0))
-
-            # Execute winner if enabled, focused, and not violating global min-gap
-            executed = False
-            reason = None
-            if winner:
-                if not injection_enabled:
-                    reason = "disabled"
-                    print("Injection disabled")
-                elif not is_target_focused():
-                    reason = "not_focused"
-                else:
-                    # Enforce global min execution gap
-                    now_s = time.time()
-                    if (now_s - last_exec_ts) * 1000.0 < MIN_EXECUTION_GAP_MS:
-                        reason = "global_gap"
-                    else:
-                        try:
-                            handler = game.commands.get(winner)
-                            if handler:
-                                print(f"Executing '{winner}'")
-                                handler("vote")
-                                # immediate reset
-                                release_all()
-                                executed = True
-                                # record last execution time
-                                last_exec_ts = time.time()
-                        except Exception as e:
-                            reason = f"error:{e}"
-                            now_s = time.time()
-                            error_times.append(now_s)
-                            # prune
-                            while (
-                                error_times
-                                and now_s - error_times[0] > ERROR_WINDOW_SEC
-                            ):
-                                error_times.popleft()
-                            if len(error_times) >= ERROR_TRIP_THRESHOLD:
-                                injection_enabled = False
-                                release_all()
-                                print(
-                                    f"Circuit breaker tripped to prevent fatal issues. Too many errors triggered."
-                                )
-
-            # Summary line
-            total_votes = sum(counts.values())
-            payload = {
-                "ts": time.time(),
-                "winner": winner,
-                "executed": executed,
-                "total_votes": total_votes,
-                "unknown": unknown,
-                "reason": reason,
-            }
-
-            # Reset window
-            window_end = now + VOTE_WINDOW_SEC
-            last_vote_by_user.clear()
-            counts.clear()
-            last_ts_by_cmd.clear()
-            unknown = 0
+            result = collect_votes(client, game)
+            if result is None:
+                continue
+            winner, total_votes, unknown, generation = result
+            if winner is None:
+                continue
+            if (time.monotonic() - last_exec_ts) * 1000 < MIN_EXECUTION_GAP_MS:
+                print(f"Skipped {winner!r}: the minimum input gap has not elapsed.")
+                continue
+            try:
+                canonical = game.profile["aliases"][winner]
+                run_macro(
+                    game.canonical_to_macros[canonical],
+                    expected_vote_generation=generation,
+                )
+            except MacroCancelled as exc:
+                print(f"Cancelled {winner!r}: {exc}")
+            except Exception as exc:
+                print(f"Failed to execute {winner!r}: {exc}")
+                now = time.monotonic()
+                error_times.append(now)
+                while error_times and now - error_times[0] > ERROR_WINDOW_SEC:
+                    error_times.popleft()
+                if cleanup_failed or len(error_times) >= ERROR_TRIP_THRESHOLD:
+                    injection_enabled = False
+                    print(
+                        "Input disabled after input errors. Check the reported failure before re-enabling."
+                    )
+            else:
+                last_exec_ts = time.monotonic()
+                print(
+                    f"Completed {winner!r} from {total_votes} viewer votes; ignored {unknown} unknown commands."
+                )
     except KeyboardInterrupt:
-        print("Stopping Twitch Plays Every Game.")
-    except Exception:
-        print("fatal error in main loop")
-        raise
+        print("Stopping TwitchPlays Everything.")
     finally:
+        injection_enabled = False
+        request_stop()
         release_all()
-        client.close()
+        unregister_hotkeys()
+        if client is not None:
+            client.close()
 
 
 def keycode_from_name(name: str) -> Optional[int]:
@@ -647,6 +942,8 @@ def keycode_from_name(name: str) -> Optional[int]:
 def execute_macro(steps: list) -> None:
     MAX_MS = 3000
     for step in steps or []:
+        with input_lock:
+            check_input_allowed()
         if not isinstance(step, dict):
             continue
         t = str(step.get("type") or "").lower()
@@ -679,11 +976,7 @@ def execute_macro(steps: list) -> None:
             ms = min(MAX_MS, max(0, int(step.get("duration_ms") or 0)))
             kcodes = [keycode_from_name(str(n or "")) for n in keys]
             kcodes = [k for k in kcodes if k]
-            for kc in kcodes:
-                press_hold(kc)
-            time.sleep(ms / 1000.0 if ms else 0)
-            for kc in kcodes:
-                release(kc)
+            hold_inputs([("key", code) for code in kcodes], ms / 1000.0)
         elif t == "mouse_down":
             b = str(step.get("button") or "left").lower()
             mouse_down(b)
@@ -703,10 +996,7 @@ def execute_macro(steps: list) -> None:
         elif t in {"mouse_hold", "mouse_pulse"}:
             b = str(step.get("button") or "left").lower()
             ms = min(MAX_MS, max(0, int(step.get("duration_ms") or 0)))
-            mouse_down(b)
-            if ms:
-                time.sleep(ms / 1000.0)
-            mouse_up(b)
+            hold_inputs([("mouse", b)], ms / 1000.0)
         elif t == "mouse_move":
             dx = int(step.get("dx") or 0)
             dy = int(step.get("dy") or 0)
@@ -723,33 +1013,61 @@ def normalize_parallel_thread(thread) -> list:
 
 def execute_parallel_threads(thread_specs: list) -> None:
     errors = []
-    running_threads = []
+    workers = []
+    cancellation = None
 
-    def run_thread(thread_steps: list) -> None:
+    def run_thread(thread_steps: list, finished: threading.Event) -> None:
         try:
             execute_macro(thread_steps)
         except Exception as exc:
             errors.append(exc)
+            cancel_input()
+        finally:
+            finished.set()
 
-    for thread_spec in thread_specs:
-        thread_steps = normalize_parallel_thread(thread_spec)
-        if not thread_steps:
-            continue
-        thread = threading.Thread(target=run_thread, args=(thread_steps,))
-        thread.start()
-        running_threads.append(thread)
-
-    for thread in running_threads:
-        thread.join()
-
+    try:
+        for thread_spec in thread_specs:
+            finished = threading.Event()
+            thread = threading.Thread(
+                target=run_thread,
+                args=(normalize_parallel_thread(thread_spec), finished),
+            )
+            thread.start()
+            workers.append((thread, finished))
+        for thread, finished in workers:
+            while not finished.wait(0.05):
+                with input_lock:
+                    check_input_allowed()
+    except MacroCancelled as exc:
+        cancel_input()
+        cancellation = exc
+    except BaseException:
+        cancel_input()
+        raise
+    finally:
+        # A KeyboardInterrupt can interrupt join before a worker has exited.
+        for thread, finished in workers:
+            while True:
+                try:
+                    if finished.wait(0.05):
+                        thread.join()
+                        break
+                except KeyboardInterrupt:
+                    request_stop()
     if errors:
-        raise RuntimeError(f"Parallel macro thread failed: {errors[0]}")
+        # Preserve the failure that cancelled the other branches.
+        raise next(
+            (error for error in errors if not isinstance(error, MacroCancelled)),
+            errors[0],
+        )
+    if cancellation is not None:
+        raise cancellation
 
 
 def select_profile_game(path: Path) -> ProfileGame:
     with open(path, "r", encoding="utf-8") as f:
         prof = json.load(f)
-    return ProfileGame(prof)
+    return ProfileGame(validate_profile(prof, str(path)))
 
 
 if __name__ == "__main__":
