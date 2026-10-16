@@ -11,12 +11,12 @@
 import concurrent.futures
 import importlib
 import json
+import math
+from datetime import datetime
 import queue
 import re
-import sys
 import threading
 import time
-import traceback
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,6 +78,8 @@ EVENTSUB_KEEPALIVE_GRACE_SECONDS = 5
 EVENTSUB_WEBSOCKET_URL = "wss://eventsub.wss.twitch.tv/ws"
 MAX_STORED_MESSAGE_IDS = 2048
 TOKEN_REFRESH_MARGIN_SECONDS = 300
+TOKEN_VALIDATION_INTERVAL_SECONDS = 3600
+MAX_CHAT_MESSAGE_LENGTH = 64
 TWITCH_CONFIG_EXAMPLE_FILE_NAME = "twitch_config.example.json"
 TWITCH_CONFIG_FILE_NAME = "twitch_config.json"
 TWITCH_HELIX_SUBSCRIPTIONS_URL = "https://api.twitch.tv/helix/eventsub/subscriptions"
@@ -114,6 +116,28 @@ def load_twitchplays_config() -> Dict[str, Any]:
     return raw
 
 
+def message_timestamp(value) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        result = datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def message_in_window(
+    message: dict, start: float, end: float, start_wall: float
+) -> bool:
+    received = message.get("received_at", time.monotonic())
+    if not start <= received < end:
+        return False
+    published = message.get("published_at")
+    if published is not None:
+        return published >= start_wall
+    return message.get("fetch_started_at", start) >= start
+
+
 @dataclass
 class TwitchSessionState:
     channel: str
@@ -121,7 +145,11 @@ class TwitchSessionState:
     chat_user_id: str
     broadcaster_user_id: str
     token_refresh_at: Optional[float] = None
-    message_queue: "queue.Queue[Dict[str, str]]" = field(default_factory=queue.Queue)
+    token_validation_at: float = field(
+        default_factory=lambda: time.monotonic() + TOKEN_VALIDATION_INTERVAL_SECONDS
+    )
+    message_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=200))
+    dropped_messages: int = 0
     seen_message_ids: Deque[str] = field(default_factory=deque)
     seen_message_id_lookup: Set[str] = field(default_factory=set)
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -134,7 +162,10 @@ class TwitchRevocationError(RuntimeError):
 
 
 class Twitch:
-    def __init__(self) -> None:
+    def __init__(self, message_limit: int = 200) -> None:
+        self.message_limit = message_limit
+        self.connected = False
+        self.stopped = False
         self.channel: str = ""
         self.session: Optional[TwitchSessionState] = None
         self.reader_thread: Optional[threading.Thread] = None
@@ -146,6 +177,7 @@ class Twitch:
             )
 
         self.close()
+        self.stopped = False
 
         normalized_channel = self.normalize_channel(channel)
         if not normalized_channel:
@@ -155,24 +187,34 @@ class Twitch:
         auth = self.load_auth()
 
         print(f"Connecting to Twitch chat for {self.channel}...")
-        chat_user_id, broadcaster_user_id, token_refresh_at = self.resolve_twitch_ids(
-            auth, self.channel
-        )
         session = TwitchSessionState(
             channel=self.channel,
             auth=auth,
-            chat_user_id=chat_user_id,
-            broadcaster_user_id=broadcaster_user_id,
-            token_refresh_at=token_refresh_at,
+            chat_user_id="",
+            broadcaster_user_id="",
+            message_queue=queue.Queue(maxsize=self.message_limit),
         )
-        ws, keepalive_timeout = self.establish_eventsub_session(
-            session, EVENTSUB_WEBSOCKET_URL, create_subscription=True
-        )
-
+        ws, keepalive_timeout = None, 10
+        try:
+            (
+                session.chat_user_id,
+                session.broadcaster_user_id,
+                session.token_refresh_at,
+            ) = self.resolve_twitch_ids(auth, self.channel)
+            ws, keepalive_timeout = self.establish_eventsub_session(
+                session, EVENTSUB_WEBSOCKET_URL, create_subscription=True
+            )
+        except TwitchRevocationError:
+            self.stopped = True
+            raise
+        except (RuntimeError, requests.RequestException) as exc:
+            print(
+                f"Twitch initial connection failed ({type(exc).__name__}); reconnecting in the reader."
+            )
         with session.ws_lock:
             session.ws = ws
-
         self.session = session
+        self.connected = ws is not None
 
         self.reader_thread = threading.Thread(
             target=self.reader_loop,
@@ -181,21 +223,32 @@ class Twitch:
             daemon=True,
         )
         self.reader_thread.start()
-        print(f"Twitch chat connected for {self.channel}.")
+        if self.connected:
+            print(f"Twitch chat connected for {self.channel}.")
 
-    def twitch_receive_messages(self) -> List[Dict[str, str]]:
+    def twitch_receive_messages(self) -> List[Dict[str, Any]]:
         session = self.session
         if session is None:
             return []
 
-        messages: List[Dict[str, str]] = []
-        while True:
+        with session.ws_lock:
+            dropped = session.dropped_messages
+            session.dropped_messages = 0
+        if dropped:
+            print(
+                f"Discarded {dropped} Twitch messages because the chat queue was full."
+            )
+        messages = []
+        for index in range(self.message_limit):
             try:
                 messages.append(session.message_queue.get_nowait())
             except queue.Empty:
-                return messages
+                break
+        return messages
 
     def close(self) -> None:
+        self.stopped = True
+        self.connected = False
         session = self.session
         reader_thread = self.reader_thread
         self.session = None
@@ -290,7 +343,12 @@ class Twitch:
         self, auth: Dict[str, str], response: requests.Response
     ) -> Dict[str, Any]:
         if not response.ok:
-            raise RuntimeError(
+            error_type = (
+                TwitchRevocationError
+                if response.status_code in (401, 403)
+                else RuntimeError
+            )
+            raise error_type(
                 f"Twitch token validation failed. {self.describe_response_error(response)}"
             )
 
@@ -299,13 +357,13 @@ class Twitch:
             raise RuntimeError("Twitch token validation returned an invalid response.")
         validated_client_id = str(data.get("client_id") or "").strip()
         if validated_client_id != auth["client_id"]:
-            raise RuntimeError(
+            raise TwitchRevocationError(
                 "TwitchPlays config client_id does not match the access token client_id."
             )
 
         scopes = data.get("scopes") or []
         if TWITCH_READ_CHAT_SCOPE not in scopes:
-            raise RuntimeError(
+            raise TwitchRevocationError(
                 f"Twitch access token is missing the `{TWITCH_READ_CHAT_SCOPE}` scope."
             )
         return data
@@ -332,15 +390,26 @@ class Twitch:
         except (TypeError, ValueError):
             return None
 
-        return time.time() + max(0, expires_in - TOKEN_REFRESH_MARGIN_SECONDS)
+        return time.monotonic() + max(0, expires_in - TOKEN_REFRESH_MARGIN_SECONDS)
 
     def refresh_token_if_due(self, session: TwitchSessionState) -> None:
-        if session.token_refresh_at is None or time.time() < session.token_refresh_at:
+        now = time.monotonic()
+        refresh_due = (
+            session.token_refresh_at is not None and now >= session.token_refresh_at
+        )
+        if not refresh_due and now < session.token_validation_at:
             return
-
-        self.refresh_access_token(session.auth)
+        if refresh_due:
+            self.refresh_access_token(session.auth)
         token_info = self.validate_user_token(session.auth)
+        if str(token_info.get("user_id") or "") != session.chat_user_id:
+            raise TwitchRevocationError(
+                "Twitch token no longer belongs to the connected chat account."
+            )
         session.token_refresh_at = self.next_token_refresh_at(token_info)
+        session.token_validation_at = (
+            time.monotonic() + TOKEN_VALIDATION_INTERVAL_SECONDS
+        )
 
     def refresh_access_token(self, auth: Dict[str, str]) -> None:
         body = {
@@ -358,7 +427,12 @@ class Twitch:
             timeout=API_TIMEOUT_SECONDS,
         )
         if not response.ok:
-            raise RuntimeError(
+            error_type = (
+                TwitchRevocationError
+                if response.status_code in (400, 401, 403)
+                else RuntimeError
+            )
+            raise error_type(
                 f"Twitch token refresh failed. {self.describe_response_error(response)}"
             )
 
@@ -428,6 +502,10 @@ class Twitch:
                 json_body=json_body,
                 allow_refresh=False,
             )
+        if response.status_code in (401, 403):
+            raise TwitchRevocationError(
+                f"Twitch rejected authorization for the Helix request (HTTP {response.status_code})."
+            )
         return response
 
     def establish_eventsub_session(
@@ -437,6 +515,8 @@ class Twitch:
         *,
         create_subscription: bool,
     ) -> Tuple[Any, int]:
+        if session.stop_event.is_set():
+            raise RuntimeError("Twitch connection was stopped.")
         ws = self.open_websocket(ws_url)
         try:
             welcome = self.wait_for_welcome(ws, session.channel)
@@ -449,6 +529,8 @@ class Twitch:
                 raise RuntimeError(
                     "Twitch EventSub welcome message did not include a session ID."
                 )
+            if session.stop_event.is_set():
+                raise RuntimeError("Twitch connection was stopped.")
             if create_subscription:
                 self.create_chat_subscription(session, welcome_session_id)
             return ws, keepalive_timeout
@@ -473,8 +555,8 @@ class Twitch:
             ) from exc
 
     def wait_for_welcome(self, ws: Any, channel: str) -> Dict[str, Any]:
-        deadline = time.time() + API_TIMEOUT_SECONDS
-        while time.time() < deadline:
+        deadline = time.monotonic() + API_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
             try:
                 raw = ws.recv()
             except WebSocketTimeoutException:
@@ -538,11 +620,13 @@ class Twitch:
         while not session.stop_event.is_set():
             try:
                 while not session.stop_event.is_set():
+                    if ws is None:
+                        raise RuntimeError("Twitch has no active socket.")
                     self.refresh_token_if_due(session)
                     try:
                         raw = ws.recv()
                     except WebSocketTimeoutException:
-                        if time.time() > keepalive_deadline:
+                        if time.monotonic() > keepalive_deadline:
                             raise RuntimeError(
                                 "Timed out waiting for Twitch EventSub keepalive traffic."
                             )
@@ -605,6 +689,8 @@ class Twitch:
                             keepalive_timeout
                         )
             except TwitchRevocationError as exc:
+                self.connected = False
+                self.stopped = True
                 session.stop_event.set()
                 print(f"Twitch chat transport stopped for {session.channel}. {exc}")
                 break
@@ -612,6 +698,12 @@ class Twitch:
                 if session.stop_event.is_set():
                     break
 
+                self.connected = False
+                for index in range(self.message_limit):
+                    try:
+                        session.message_queue.get_nowait()
+                    except queue.Empty:
+                        break
                 print(
                     f"Twitch chat transport failed for {session.channel}. Reconnecting in {reconnect_backoff} seconds. {exc}"
                 )
@@ -635,6 +727,7 @@ class Twitch:
                         create_subscription=True,
                     )
                 except TwitchRevocationError as reconnect_exc:
+                    self.stopped = True
                     session.stop_event.set()
                     print(
                         f"Twitch chat transport stopped for {session.channel}. {reconnect_exc}"
@@ -650,18 +743,26 @@ class Twitch:
                     continue
 
                 with session.ws_lock:
+                    if session.stop_event.is_set():
+                        self.safe_close_ws(ws)
+                        break
                     session.ws = ws
+                    self.connected = True
+                session.token_validation_at = (
+                    time.monotonic() + TOKEN_VALIDATION_INTERVAL_SECONDS
+                )
                 keepalive_deadline = self.next_keepalive_deadline(keepalive_timeout)
                 reconnect_backoff = 1
                 print(f"Twitch chat reconnected for {session.channel}.")
 
+        self.connected = False
         with session.ws_lock:
             if session.ws is ws:
                 session.ws = None
         self.safe_close_ws(ws)
 
     def next_keepalive_deadline(self, keepalive_timeout: int) -> float:
-        return time.time() + keepalive_timeout + EVENTSUB_KEEPALIVE_GRACE_SECONDS
+        return time.monotonic() + keepalive_timeout + EVENTSUB_KEEPALIVE_GRACE_SECONDS
 
     def parse_eventsub_message(self, raw: Any) -> Dict[str, Any]:
         if isinstance(raw, bytes):
@@ -703,7 +804,24 @@ class Twitch:
         if not username or not message_text:
             return
 
-        session.message_queue.put({"username": username, "message": message_text})
+        if len(message_text) > MAX_CHAT_MESSAGE_LENGTH or session.stop_event.is_set():
+            return
+        item = {
+            "username": username,
+            "message": message_text,
+            "platform": "twitch",
+            "user_id": str(event.get("chatter_user_id") or ""),
+            "message_id": message_id,
+            "received_at": time.monotonic(),
+            "published_at": message_timestamp(
+                (message.get("metadata") or {}).get("message_timestamp")
+            ),
+        }
+        try:
+            session.message_queue.put_nowait(item)
+        except queue.Full:
+            with session.ws_lock:
+                session.dropped_messages += 1
 
     def track_message_id(self, session: TwitchSessionState, message_id: str) -> bool:
         if message_id in session.seen_message_id_lookup:
@@ -726,18 +844,7 @@ class Twitch:
         return f"Twitch revoked the `{subscription_type}` subscription for `{channel}` with status `{status}`."
 
     def describe_response_error(self, response: requests.Response) -> str:
-        try:
-            data = response.json()
-        except Exception:
-            data = None
-
-        if isinstance(data, dict):
-            for key in ("message", "error_description", "error"):
-                value = str(data.get(key) or "").strip()
-                if value:
-                    return f"{response.status_code} {value}"
-
-        return f"{response.status_code} {response.text.strip()}"
+        return f"HTTP {response.status_code}"
 
     def safe_close_ws(self, ws_obj: Any) -> None:
         if ws_obj is None:
@@ -754,80 +861,85 @@ class Twitch:
             pass
 
 
+class YouTubeFallbackError(RuntimeError):
+    pass
+
+
+class ChatEndedError(RuntimeError):
+    pass
+
+
+class YouTubeAuthorizationError(RuntimeError):
+    pass
+
+
 # Thanks to Ottomated for helping with the yt side of things!
 class YouTube:
-    """
-    YouTube live chat reader with API-first, scrape-fallback behavior.
+    """Poll the API when configured, otherwise use the existing HTML reader."""
 
-    When an API key is provided:
-        1) Resolve active liveChatId via API (from stream URL's videoId or by searching the channel).
-        2) Poll liveChatMessages.list using nextPageToken and pollingIntervalMillis.
-        3) On quota errors (403 + reason quotaExceeded/dailyLimitExceeded), fall back to scraper.
-
-    When no API key is provided: use the existing scraper immediately.
-    """
-
-    def __init__(self, api_key: Optional[str] = None) -> None:
-        self.session: Optional[requests.Session] = None
-        self.config: Dict[str, Any] = {}
-        self.payload: Dict[str, Any] = {}
-
+    def __init__(self, api_key: Optional[str] = None, message_limit: int = 200) -> None:
+        self.session = None
+        self.config = {}
+        self.payload = {}
+        self.message_limit = message_limit
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        self.fetch_job: Optional[concurrent.futures.Future] = None
+        self.fetch_job = None
         self.next_fetch_time = 0.0
-
-        self.channel_id: Optional[str] = None
-        self.stream_url: Optional[str] = None
-
-        # scrape regexes
+        self.poll_interval = YOUTUBE_FETCH_INTERVAL
+        self.channel_id = None
+        self.stream_url = None
+        self.api_key = api_key
+        self.use_api = bool(api_key)
+        self.live_chat_id = None
+        self.next_page_token = None
+        self.connected = False
+        self.stopped = False
+        self.stop_event = threading.Event()
+        self.needs_connect = True
+        self.bootstrap_pending = True
+        self.seen_message_ids = deque()
+        self.seen_message_id_lookup = set()
         self.re_initial_data = re.compile(
             r"(?:window\s*\[\s*[\"']ytInitialData[\"']\s*\]|ytInitialData)\s*=\s*({.+?})\s*;"
         )
         self.re_config = re.compile(r"(?:ytcfg\s*.set)\(({.+?})\)\s*;")
 
-        # API mode state
-        self.api_key: Optional[str] = api_key
-        self.use_api: bool = bool(api_key)
-        self.live_chat_id: Optional[str] = None
-        self.next_page_token: Optional[str] = None
-
-    # ---------------------------
-    # Public connect entry point
-    # ---------------------------
-    def youtube_connect(
-        self,
-        channel_id: Optional[str],
-        stream_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-    ) -> None:
+    def youtube_connect(self, channel_id, stream_url=None, api_key=None) -> None:
+        if self.stop_event.is_set():
+            raise RuntimeError("The YouTube reader is closed.")
+        self.channel_id, self.stream_url = channel_id, stream_url
         if api_key is not None:
             self.api_key = api_key
             self.use_api = bool(api_key)
-
-        self.channel_id = channel_id
-        self.stream_url = stream_url
-        if not self.channel_id and not self.stream_url:
+        if not channel_id and not stream_url:
             raise RuntimeError("YouTube requires either a channel ID or a stream URL.")
+        try:
+            if self.use_api:
+                try:
+                    if self.api_connect():
+                        self.connected = True
+                        self.needs_connect = False
+                        print("Connected to YouTube via API.")
+                        return
+                except (YouTubeFallbackError, requests.RequestException):
+                    pass
+                self.switch_to_scrape_mode("The API connection could not be used.")
+            self.scrape_connect()
+            self.connected = True
+            self.needs_connect = False
+        except (ChatEndedError, YouTubeAuthorizationError):
+            self.connected = False
+            self.stopped = True
+            raise
 
-        if self.use_api:
-            ok = self.api_connect()
-            if ok:
-                print("Connected to YouTube via API.")
-                return
-            print("Falling back to HTML scraping...")
-        # scraper fallback / no key:
-        self.scrape_connect()
-
-    # ---------------------------
-    # API path
-    # ---------------------------
     def extract_video_id_from_url(self, url: str) -> Optional[str]:
-        # supports youtu.be/<id>, youtube.com/watch?v=<id>, youtube.com/live/<id>
-        m = re.search(r"(?:v=|/live/|youtu\.be/)([A-Za-z0-9_\-]{6,})", url)
-        return m.group(1) if m else None
+        match = re.search(r"(?:v=|/live/|youtu\.be/)([A-Za-z0-9_\-]{6,})", url)
+        return match.group(1) if match else None
 
     def http(self) -> requests.Session:
-        if not self.session:
+        if self.stop_event.is_set():
+            raise RuntimeError("The YouTube reader is closed.")
+        if self.session is None:
             self.session = requests.Session()
             self.session.headers["User-Agent"] = (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -838,248 +950,172 @@ class YouTube:
             )
         return self.session
 
-    def api_connect(self) -> bool:
+    def response_reasons(self, response) -> set:
         try:
-            sess = self.http()
-            video_id = None
+            data = response.json()
+        except ValueError:
+            return set()
+        return {item.get("reason") for item in data.get("error", {}).get("errors", [])}
 
-            # 1) Determine live videoId
-            if self.stream_url:
-                video_id = self.extract_video_id_from_url(self.stream_url)
+    def is_quota_error(self, response) -> bool:
+        return bool(
+            self.response_reasons(response) & {"quotaExceeded", "dailyLimitExceeded"}
+        )
 
-            if not video_id and self.channel_id:
-                # search.list: find the live video for this channel
-                # eventType=live, type=video
-                params = {
+    def check_response(self, response, operation: str) -> None:
+        if response.ok:
+            return
+        reasons = self.response_reasons(response)
+        if reasons & {"quotaExceeded", "dailyLimitExceeded"}:
+            raise YouTubeFallbackError(
+                f"YouTube quota was exhausted during {operation}."
+            )
+        if reasons & {"liveChatEnded", "liveChatDisabled", "liveChatNotFound"}:
+            raise ChatEndedError(
+                f"YouTube chat is unavailable during {operation}: {', '.join(sorted(reasons))}."
+            )
+        # Google also uses 403 for temporary request limits.
+        if response.status_code == 401 or (
+            response.status_code == 403
+            and (
+                not reasons
+                or reasons
+                & {"forbidden", "insufficientPermissions", "accessNotConfigured"}
+            )
+        ):
+            raise YouTubeAuthorizationError(
+                f"YouTube denied access during {operation} (HTTP {response.status_code}). Check video access and the configured credentials."
+            )
+        # Request exceptions can include URLs containing API keys; report only status.
+        raise requests.HTTPError(
+            f"YouTube {operation} failed (HTTP {response.status_code}).",
+            response=response,
+        )
+
+    def api_connect(self) -> bool:
+        video_id = (
+            self.extract_video_id_from_url(self.stream_url) if self.stream_url else None
+        )
+        if not video_id and self.channel_id:
+            response = self.http().get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
                     "part": "id",
                     "channelId": self.channel_id,
                     "eventType": "live",
                     "type": "video",
                     "maxResults": 1,
                     "key": self.api_key,
-                }
-                r = sess.get(
-                    "https://www.googleapis.com/youtube/v3/search",
-                    params=params,
-                    timeout=10,
-                )
-                if r.status_code == 403 and self.is_quota_error(r):
-                    self.switch_to_scrape_mode("quota while search.list")
-                    return False
-                r.raise_for_status()
-                data = r.json()
-                items = data.get("items") or []
-                if items:
-                    video_id = items[0]["id"]["videoId"]
-
-            if not video_id:
-                print("Could not resolve a live video for the channel.")
+                },
+                timeout=API_TIMEOUT_SECONDS,
+            )
+            if not response.ok and not self.is_quota_error(response):
+                print(f"YouTube video search failed (HTTP {response.status_code}).")
                 return False
-
-            # 2) videos.list: get liveStreamingDetails.activeLiveChatId
-            params = {
+            self.check_response(response, "video search")
+            items = response.json().get("items") or []
+            video_id = items[0]["id"]["videoId"] if items else None
+        if not video_id:
+            raise ChatEndedError(
+                "YouTube has no live video for the configured channel or URL."
+            )
+        response = self.http().get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
                 "part": "liveStreamingDetails",
                 "id": video_id,
                 "key": self.api_key,
-            }
-            r = sess.get(
-                "https://www.googleapis.com/youtube/v3/videos",
-                params=params,
-                timeout=10,
+            },
+            timeout=API_TIMEOUT_SECONDS,
+        )
+        if not response.ok and not self.is_quota_error(response):
+            print(f"YouTube live chat lookup failed (HTTP {response.status_code}).")
+            return False
+        self.check_response(response, "live chat lookup")
+        items = response.json().get("items") or []
+        self.live_chat_id = (
+            items[0].get("liveStreamingDetails", {}).get("activeLiveChatId")
+            if items
+            else None
+        )
+        if not self.live_chat_id:
+            raise ChatEndedError(
+                "YouTube live chat is not active on the configured video."
             )
-            if r.status_code == 403 and self.is_quota_error(r):
-                self.switch_to_scrape_mode("quota while videos.list")
-                return False
-            r.raise_for_status()
-            data = r.json()
-            items = data.get("items") or []
-            if not items:
-                print("Video not found or not live.")
-                return False
-
-            lcd = items[0].get("liveStreamingDetails", {})
-            self.live_chat_id = lcd.get("activeLiveChatId")
-            if not self.live_chat_id:
-                print("Live chat is not active on this video.")
-                return False
-
-            # reset API poll state
-            self.next_page_token = None
-            self.next_fetch_time = 0.0
-            return True
-
-        except requests.HTTPError as e:
-            if (
-                e.response is not None
-                and e.response.status_code == 403
-                and self.is_quota_error(e.response)
-            ):
-                self.switch_to_scrape_mode("quota while connecting")
-                return False
-            traceback.print_exc()
-            return False
-        except Exception:
-            traceback.print_exc()
-            return False
-
-    def is_quota_error(self, resp: requests.Response) -> bool:
-        try:
-            err = resp.json().get("error", {})
-            for e in err.get("errors", []):
-                if e.get("reason") in ("quotaExceeded", "dailyLimitExceeded"):
-                    return True
-        except Exception:
-            pass
-        return False
+        self.next_page_token = None
+        self.bootstrap_pending = True
+        return True
 
     def switch_to_scrape_mode(self, reason: str) -> None:
-        print(f"API quota hit ({reason}). Switching to HTML scraping fallback.")
+        # Called by the receiving thread after the pending job has finished.
+        print(f"Switching YouTube to HTML scraping. {reason}")
         self.use_api = False
-        # tear down API state
         self.live_chat_id = None
         self.next_page_token = None
-        self.fetch_job = None
-        self.next_fetch_time = 0.0
-        # re-init as scraper
-        try:
-            if self.session:
-                self.session.close()
-        except Exception:
-            pass
-        self.session = None
-        self.scrape_connect()
+        self.needs_connect = True
+        self.bootstrap_pending = True
+        if self.session is not None:
+            self.session.close()
+            self.session = None
 
-    def api_fetch_messages(self) -> List[Dict[str, Any]]:
-        if not (self.api_key and self.live_chat_id):
-            return []
-
-        # Respect server-provided pacing: we'll set next_fetch_time in the caller.
+    def api_fetch_messages(self) -> list:
         params = {
             "part": "snippet,authorDetails",
             "liveChatId": self.live_chat_id,
-            "maxResults": 2000,
+            "maxResults": min(2000, max(200, self.message_limit)),
             "key": self.api_key,
         }
         if self.next_page_token:
             params["pageToken"] = self.next_page_token
-
-        try:
-            r = self.http().get(
-                "https://www.googleapis.com/youtube/v3/liveChat/messages",
-                params=params,
-                timeout=10,
-            )
-        except Exception as e:
-            print(f"Failed to fetch API messages: {e}")
-            return []
-
-        if r.status_code == 403 and self.is_quota_error(r):
-            self.switch_to_scrape_mode("quota on liveChatMessages.list")
-            return []
-
-        if not r.ok:
-            print(f"API fetch failed. {r.status_code} {r.reason}")
-            return []
-
-        data = r.json()
+        response = self.http().get(
+            "https://www.googleapis.com/youtube/v3/liveChat/messages",
+            params=params,
+            timeout=API_TIMEOUT_SECONDS,
+        )
+        self.check_response(response, "chat polling")
+        data = response.json()
         self.next_page_token = data.get("nextPageToken")
-        # schedule next poll based on API hint
-        poll_ms = int(data.get("pollingIntervalMillis", 1000))
-        self.next_fetch_time = time.time() + (poll_ms / 1000.0)
-
-        msgs: List[Dict[str, Any]] = []
+        self.poll_interval = max(
+            YOUTUBE_FETCH_INTERVAL,
+            int(data.get("pollingIntervalMillis", 1000)) / 1000.0,
+        )
+        messages = []
         for item in data.get("items", []):
-            s = item.get("snippet", {})
-            a = item.get("authorDetails", {})
-            # normalize to the template's expected shape
-            msgs.append(
+            snippet, author = item.get("snippet", {}), item.get("authorDetails", {})
+            messages.append(
                 {
-                    "author": a.get("displayName", "") or a.get("channelId", ""),
-                    "content": [{"text": s.get("displayMessage", "")}],
+                    "username": author.get("displayName")
+                    or author.get("channelId", ""),
+                    "message": snippet.get("displayMessage", ""),
+                    "user_id": author.get("channelId", ""),
+                    "message_id": item.get("id", ""),
+                    "published_at": message_timestamp(snippet.get("publishedAt")),
                 }
             )
-        return msgs
-
-    # ---------------------------
-    # Scraper path (unchanged logic, factored into methods)
-    # ---------------------------
-    def reconnect(self, delay: float) -> None:
-        # Cancel pending fetch job if any
-        if self.fetch_job and self.fetch_job.running():
-            try:
-                self.fetch_job.cancel()
-            except Exception:
-                pass
-            else:
-                try:
-                    self.fetch_job.result(timeout=0.1)
-                except Exception:
-                    pass
-
-        print(f"Retrying in {delay} seconds...")
-        if self.session:
-            try:
-                self.session.close()
-            except Exception:
-                pass
-
-        self.session = None
-        self.config = {}
-        self.payload = {}
-        self.fetch_job = None
-        self.next_fetch_time = 0
-        time.sleep(max(0.0, delay))
-
-        # Attempt reconnect
-        if self.channel_id or self.stream_url:
-            # reconnect preserving mode
-            if self.use_api:
-                self.api_connect()
-            else:
-                self.scrape_connect()
+        if data.get("offlineAt"):
+            raise ChatEndedError("YouTube reported that the live chat has ended.")
+        return messages
 
     def scrape_connect(self) -> None:
-        print("Connecting to YouTube (HTML scrape)...")
-
-        # Create http client session
-        self.session = requests.Session()
-        self.session.headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        print("Connecting to YouTube using HTML scraping...")
+        live_url = (
+            self.stream_url or f"https://youtube.com/channel/{self.channel_id}/live"
         )
-        requests.utils.add_dict_to_cookiejar(self.session.cookies, {"CONSENT": "YES+"})
-
-        # Connect using stream_url if provided, otherwise use the channel_id
-        if self.stream_url is not None:
-            live_url = self.stream_url
-        else:
-            live_url = f"https://youtube.com/channel/{self.channel_id}/live"
-
-        res = self.session.get(live_url)
-        if res.status_code == 404:
-            live_url = f"https://youtube.com/c/{self.channel_id}/live"
-            res = self.session.get(live_url)
-        if not res.ok:
-            if self.stream_url is not None:
-                print(
-                    f"Couldn't load the stream URL ({res.status_code} {res.reason}). Is the stream URL correct? {self.stream_url}"
-                )
-            else:
-                print(
-                    f"Couldn't load livestream page ({res.status_code} {res.reason}). Is the channel ID correct? {self.channel_id}"
-                )
-            time.sleep(5)
-            sys.exit(1)
-        livestream_page = res.text
-
-        matches = list(self.re_initial_data.finditer(livestream_page))
-        if len(matches) == 0:
-            print("Couldn't find initial data in livestream page")
-            time.sleep(5)
-            sys.exit(1)
-        initial_data = json.loads(matches[0].group(1))
-
+        response = self.http().get(live_url, timeout=API_TIMEOUT_SECONDS)
+        if response.status_code == 404 and not self.stream_url:
+            response = self.http().get(
+                f"https://youtube.com/c/{self.channel_id}/live",
+                timeout=API_TIMEOUT_SECONDS,
+            )
+        self.check_response(response, "livestream page loading")
+        match = self.re_initial_data.search(response.text)
+        if not match:
+            raise RuntimeError(
+                "YouTube livestream page contained no initial chat data."
+            )
+        initial = json.loads(match.group(1))
         try:
-            iframe_continuation = initial_data["contents"]["twoColumnWatchNextResults"][
+            continuation = initial["contents"]["twoColumnWatchNextResults"][
                 "conversationBar"
             ]["liveChatRenderer"]["header"]["liveChatHeaderRenderer"]["viewSelector"][
                 "sortFilterSubMenuRenderer"
@@ -1094,182 +1130,181 @@ class YouTube:
             ][
                 "continuation"
             ]
-        except Exception:
-            print(
-                f"Couldn't find the livestream chat. Is the channel not live? url: {live_url}"
-            )
-            time.sleep(5)
-            sys.exit(1)
-
-        res = self.session.get(
-            f"https://youtube.com/live_chat?continuation={iframe_continuation}"
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ChatEndedError(
+                "YouTube livestream page has no active live chat."
+            ) from exc
+        response = self.http().get(
+            "https://youtube.com/live_chat",
+            params={"continuation": continuation},
+            timeout=API_TIMEOUT_SECONDS,
         )
-        if not res.ok:
-            print(f"Couldn't load live chat page ({res.status_code} {res.reason})")
-            time.sleep(5)
-            sys.exit(1)
-        live_chat_page = res.text
-
-        matches = list(self.re_initial_data.finditer(live_chat_page))
-        if len(matches) == 0:
-            print("Couldn't find initial data in live chat page")
-            time.sleep(5)
-            sys.exit(1)
-        initial_data = json.loads(matches[0].group(1))
-
-        matches = list(self.re_config.finditer(live_chat_page))
-        if len(matches) == 0:
-            print("Couldn't find config data in live chat page")
-            time.sleep(5)
-            sys.exit(1)
-        self.config = json.loads(matches[0].group(1))
-
-        token = self.get_continuation_token(initial_data)
+        self.check_response(response, "live chat page loading")
+        initial_match = self.re_initial_data.search(response.text)
+        config_match = self.re_config.search(response.text)
+        if not initial_match or not config_match:
+            raise RuntimeError(
+                "YouTube live chat page is missing its data or configuration."
+            )
+        initial, self.config = json.loads(initial_match.group(1)), json.loads(
+            config_match.group(1)
+        )
         self.payload = {
             "context": self.config["INNERTUBE_CONTEXT"],
-            "continuation": token,
+            "continuation": self.get_continuation_token(initial),
             "webClientInfo": {"isDocumentHidden": False},
         }
-        print("Connected (scrape).")
+        self.bootstrap_pending = True
+        self.poll_interval = YOUTUBE_FETCH_INTERVAL
+        print("Connected to YouTube using HTML scraping.")
 
-    def get_continuation_token(self, data: Dict[str, Any]) -> str:
-        cont = data["continuationContents"]["liveChatContinuation"]["continuations"][0]
-        if "timedContinuationData" in cont:
-            return cont["timedContinuationData"]["continuation"]
-        else:
-            return cont["invalidationContinuationData"]["continuation"]
+    def get_continuation_token(self, data: dict) -> str:
+        continuations = (
+            data["continuationContents"]["liveChatContinuation"].get("continuations")
+            or []
+        )
+        if not continuations:
+            raise ChatEndedError("YouTube chat no longer has a live continuation.")
+        continuation = continuations[0]
+        for name in (
+            "timedContinuationData",
+            "invalidationContinuationData",
+            "reloadContinuationData",
+        ):
+            if name in continuation:
+                return continuation[name]["continuation"]
+        raise RuntimeError("YouTube returned an unsupported chat continuation.")
 
-    def fetch_messages(self) -> List[Dict[str, Any]]:
-        # scraper fetch (unchanged)
-        session = self.session
-        if session is None:
-            return []
-
-        try:
-            payload_bytes = bytes(json.dumps(self.payload), "utf8")
-            res = session.post(
-                f"https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key={self.config['INNERTUBE_API_KEY']}&prettyPrint=false",
-                payload_bytes,
-                timeout=10,
+    def fetch_messages(self) -> list:
+        response = self.http().post(
+            "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat",
+            params={"key": self.config["INNERTUBE_API_KEY"], "prettyPrint": "false"},
+            data=json.dumps(self.payload).encode("utf-8"),
+            timeout=API_TIMEOUT_SECONDS,
+        )
+        self.check_response(response, "HTML chat polling")
+        data = response.json()
+        self.payload["continuation"] = self.get_continuation_token(data)
+        messages = []
+        for action in data["continuationContents"]["liveChatContinuation"].get(
+            "actions", []
+        ):
+            item = (
+                action.get("addChatItemAction", {})
+                .get("item", {})
+                .get("liveChatTextMessageRenderer")
             )
-        except Exception as e:
-            print(f"Failed to fetch messages: {e}")
-            return []
-
-        if not res.ok:
-            print(f"Failed to fetch messages. {res.status_code} {res.reason}")
-            print("Body:", res.text[:500])
-            print("Payload:", payload_bytes)
-            try:
-                session.close()
-            except Exception:
-                pass
-            self.session = None
-            return []
-
-        try:
-            data = json.loads(res.text)
-            self.payload["continuation"] = self.get_continuation_token(data)
-            cont = data["continuationContents"]["liveChatContinuation"]
-            messages = []
-            if "actions" in cont:
-                for action in cont["actions"]:
-                    item = (
-                        action.get("addChatItemAction", {})
-                        .get("item", {})
-                        .get("liveChatTextMessageRenderer")
-                    )
-                    if item:
-                        messages.append(
-                            {
-                                "author": item["authorName"]["simpleText"],
-                                "content": item["message"]["runs"],
-                            }
-                        )
-            return messages
-        except Exception:
-            print("Failed to parse messages.")
-            print("Body (truncated):", res.text[:800])
-            traceback.print_exc()
-            return []
-
-    # unified API for the template
-    def twitch_receive_messages(self) -> List[Dict[str, str]]:
-        if self.use_api:
-            # API mode with background job + poll pacing
-            messages: List[Dict[str, str]] = []
-
-            if not self.fetch_job:
-                # only schedule if we are past the advised poll time
-                if time.time() >= self.next_fetch_time:
-                    self.fetch_job = self.thread_pool.submit(self.api_fetch_messages)
-                else:
-                    # brief nap to avoid busy-spin
-                    time.sleep(1.0 / 120.0)
-            else:
-                try:
-                    res = self.fetch_job.result(timeout=1.0 / 60.0)
-                except concurrent.futures.TimeoutError:
-                    res = []
-                except Exception:
-                    traceback.print_exc()
-                    try:
-                        if self.session:
-                            self.session.close()
-                    except Exception:
-                        pass
-                    self.session = None
-                    return []
-                else:
-                    self.fetch_job = None
-
-                for item in res:
-                    msg = {"username": item["author"], "message": ""}
-                    for part in item["content"]:
-                        if "text" in part:
-                            msg["message"] += part["text"]
-                        elif "emoji" in part:
-                            msg["message"] += part["emoji"].get("emojiId", "")
-                    messages.append(msg)
-
-            return messages
-
-        # scraper mode
-        if self.session is None:
-            self.reconnect(0)
-
-        messages: List[Dict[str, str]] = []
-
-        if not self.fetch_job:
-            time.sleep(1.0 / 120.0)
-            if time.time() > self.next_fetch_time:
-                self.fetch_job = self.thread_pool.submit(self.fetch_messages)
-        else:
-            try:
-                res = self.fetch_job.result(timeout=1.0 / 60.0)
-            except concurrent.futures.TimeoutError:
-                res = []
-            except Exception:
-                traceback.print_exc()
-                session = self.session
-                if session is not None:
-                    try:
-                        session.close()
-                    except Exception:
-                        pass
-                self.session = None
-                return []
-            else:
-                self.fetch_job = None
-                self.next_fetch_time = time.time() + YOUTUBE_FETCH_INTERVAL
-
-            for item in res:
-                msg = {"username": item["author"], "message": ""}
-                for part in item["content"]:
-                    if "text" in part:
-                        msg["message"] += part["text"]
-                    elif "emoji" in part:
-                        msg["message"] += part["emoji"].get("emojiId", "")
-                messages.append(msg)
-
+            if not item:
+                continue
+            timestamp = item.get("timestampUsec")
+            messages.append(
+                {
+                    "username": item.get("authorName", {}).get("simpleText", ""),
+                    "message": "".join(
+                        part.get("text", part.get("emoji", {}).get("emojiId", ""))
+                        for part in item.get("message", {}).get("runs", [])
+                    ),
+                    "user_id": item.get("authorExternalChannelId", ""),
+                    "message_id": item.get("id", ""),
+                    "published_at": int(timestamp) / 1_000_000 if timestamp else None,
+                }
+            )
         return messages
+
+    def fetch_batch(self) -> list:
+        started = time.monotonic()
+        if self.needs_connect:
+            if self.use_api:
+                if not self.api_connect():
+                    raise YouTubeFallbackError("The API connection could not be used.")
+            else:
+                self.scrape_connect()
+            self.needs_connect = False
+        messages = self.api_fetch_messages() if self.use_api else self.fetch_messages()
+        received = time.monotonic()
+        bootstrap = self.bootstrap_pending
+        self.bootstrap_pending = False
+        output = []
+        for message in messages:
+            message_id = message.get("message_id")
+            if message_id:
+                if message_id in self.seen_message_id_lookup:
+                    continue
+                self.seen_message_id_lookup.add(message_id)
+                self.seen_message_ids.append(message_id)
+                while len(self.seen_message_ids) > max(
+                    MAX_STORED_MESSAGE_IDS, self.message_limit
+                ):
+                    self.seen_message_id_lookup.discard(self.seen_message_ids.popleft())
+            if (
+                not bootstrap
+                and message.get("username")
+                and 0 < len(message.get("message", "")) <= MAX_CHAT_MESSAGE_LENGTH
+            ):
+                output.append(
+                    {
+                        **message,
+                        "platform": "youtube",
+                        "received_at": received,
+                        "fetch_started_at": started,
+                    }
+                )
+        if len(output) > self.message_limit:
+            print(
+                f"Discarded {len(output) - self.message_limit} YouTube messages because the chat batch was full."
+            )
+        return output[: self.message_limit]
+
+    def twitch_receive_messages(self) -> list:
+        if self.stopped or self.stop_event.is_set():
+            return []
+        if self.fetch_job is None:
+            if time.monotonic() >= self.next_fetch_time:
+                self.fetch_job = self.thread_pool.submit(self.fetch_batch)
+            return []
+        if not self.fetch_job.done():
+            return []
+        job, self.fetch_job = self.fetch_job, None
+        try:
+            messages = job.result()
+        except (ChatEndedError, YouTubeAuthorizationError) as exc:
+            self.connected = False
+            self.stopped = True
+            print(f"YouTube chat stopped. {exc}")
+        except YouTubeFallbackError as exc:
+            self.connected = False
+            self.switch_to_scrape_mode(str(exc))
+            self.next_fetch_time = time.monotonic() + max(5.0, self.poll_interval)
+        except Exception as exc:
+            self.connected = False
+            self.needs_connect = True
+            self.bootstrap_pending = True
+            self.next_fetch_time = time.monotonic() + max(5.0, self.poll_interval)
+            # Do not print exception URLs or response bodies containing credentials.
+            detail = (
+                f"HTTP {exc.response.status_code}"
+                if isinstance(exc, requests.HTTPError) and exc.response is not None
+                else type(exc).__name__
+            )
+            print(
+                f"YouTube chat polling failed ({detail}); retrying after the polling delay."
+            )
+        else:
+            if not self.connected:
+                print("YouTube chat recovered.")
+            self.connected = True
+            self.next_fetch_time = time.monotonic() + self.poll_interval
+            return messages
+        return []
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.stopped = True
+        self.connected = False
+        if self.fetch_job is not None:
+            self.fetch_job.cancel()
+        self.thread_pool.shutdown(wait=True, cancel_futures=True)
+        self.fetch_job = None
+        if self.session is not None:
+            self.session.close()
+            self.session = None
