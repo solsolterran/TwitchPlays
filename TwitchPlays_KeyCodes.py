@@ -175,6 +175,16 @@ key_name_by_code = {
     RIGHT_SHIFT: "shiftright",
     SPACE: "space",
     PERIOD: ".",
+    NUMPAD_0: "num0",
+    NUMPAD_1: "num1",
+    NUMPAD_2: "num2",
+    NUMPAD_3: "num3",
+    NUMPAD_4: "num4",
+    NUMPAD_5: "num5",
+    NUMPAD_6: "num6",
+    NUMPAD_7: "num7",
+    NUMPAD_8: "num8",
+    NUMPAD_9: "num9",
     F1: "f1",
     F2: "f2",
     F3: "f3",
@@ -278,6 +288,10 @@ if IS_WINDOWS:
     SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 
     def send_key(scan_code: int, flags: int) -> None:
+        if scan_code in (LEFT_ARROW, RIGHT_ARROW, UP_ARROW, DOWN_ARROW,
+                         RIGHT_CONTROL, RIGHT_ALT, NUMPAD_ENTER, NUMPAD_BACKSLASH):
+            scan_code &= 0x7F
+            flags |= KEYEVENTF_EXTENDEDKEY
         ki = KEYBDINPUT(
             wVk=0,
             wScan=scan_code & 0xFFFF,
@@ -289,8 +303,7 @@ if IS_WINDOWS:
         n = SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
         if n != 1:
             err = get_last_error()
-            # Print only on failure to avoid noisy logs
-            print(f"SendInput failed (scan=0x{scan_code:X} flags=0x{flags:X}) err={err}")
+            raise OSError(err, f"Windows could not send key scan 0x{scan_code:X} (flags 0x{flags:X}).")
 
     def HoldKey(hexKeyCode: int) -> None:
         send_key(hexKeyCode, KEYEVENTF_SCANCODE)
