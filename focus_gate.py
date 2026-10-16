@@ -31,6 +31,9 @@ TITLE_CONTAINS: Optional[str] = None
 
 def set_focus_target(process_name: Optional[str] = None, title_contains: Optional[str] = None) -> None:
     global TARGET_PROCESS, TITLE_CONTAINS
+    for name, value in (("target_process", process_name), ("window_title_contains", title_contains)):
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"Focus setting {name} must be a string or null.")
     # Use only the explicitly provided values; no environment fallbacks
     TARGET_PROCESS = (process_name or "").strip().lower() or None
     TITLE_CONTAINS = (title_contains or "").strip().lower() or None
@@ -153,6 +156,16 @@ def is_target_focused() -> bool:
             GetWindowTextW = user32.GetWindowTextW
             GetWindowThreadProcessId = user32.GetWindowThreadProcessId
 
+            from ctypes import wintypes
+
+            GetForegroundWindow.argtypes = ()
+            GetForegroundWindow.restype = wintypes.HWND
+            GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+            GetWindowTextLengthW.restype = ctypes.c_int
+            GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+            GetWindowTextW.restype = ctypes.c_int
+            GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+            GetWindowThreadProcessId.restype = wintypes.DWORD
             hwnd = GetForegroundWindow()
             if not hwnd:
                 return False
